@@ -5,7 +5,7 @@ Typed, serializable **signals** across the Next.js server/client boundary, plus 
 - **Type-safe end to end** — slice names, action names, and payloads are all inferred. A typo'd action or wrong payload shape in a Server Action fails `tsc`, not production.
 - **Fast by construction** — per-slice subscriptions and `Object.is` selector bailouts mean a component re-renders only when the exact value it reads changes. Store updates are an O(1) map lookup, not a reducer scan.
 - **Small** — ~1.4 kB min+gzip total, zero dependencies, React 18+ as the only peer. No Next.js import, so it can't break on a Next internals refactor.
-- **Honest about the platform** — works *with* the App Router (RSC props, Server Action return values), not against it. No `__NEXT_DATA__` or other undocumented internals.
+- **Built on documented surfaces** — works *with* the App Router (RSC props, Server Action return values), never reaching into private framework internals, so a Next.js refactor can't silently break it.
 
 ```
 npm: not yet published — see "Publishing" below.
@@ -186,10 +186,10 @@ A full runnable example lives in [`demo12/`](demo12/store.ts).
 
 **SSR / hydration.** `useBridge` passes a `getServerSnapshot` that reads `store.initial`, satisfying React 18's `useSyncExternalStore` contract — no SSR throw, no hydration mismatch. Server-created signals apply *after* hydration, in an effect. Consequence: the first client paint shows initial state. For data that must be correct at first paint, render it as ordinary RSC props/children; use signals for events and cache-sync, not initial data.
 
-**Race protection** (the two desync traps):
+**Race protection** guards the two ways async state desyncs:
 
 1. *Stale client reads* — handlers are executed against live state at dispatch time, functional-update style. Two rapid `increment`s always see each other's writes.
-2. *Chronological reversals* — every `execute` takes a monotonic sequence number at call time. If op #2's response lands before op #1's, op #1's late signal of the same type is dropped instead of overwriting newer data.
+2. *Out-of-order responses* — every `execute` takes a monotonic sequence number at call time. If op #2's response lands before op #1's, op #1's late signal of the same type is dropped instead of overwriting newer data.
 
 **Optimistic rollback** restores a slice-level snapshot taken just before the optimistic signal applied. If *other* writes hit the same slice while the action was in flight, rollback restores the snapshot over them (last-write-wins). Keep optimistic actions scoped to the state they own.
 
@@ -199,31 +199,13 @@ A full runnable example lives in [`demo12/`](demo12/store.ts).
 
 ---
 
-## Design notes — v11 → v12
-
-The v11 "finalthoughts" checklist, resolved:
-
-| Concern | Resolution |
-|---|---|
-| Server Action race conditions | Handlers already run functionally against live state; added the `execute` sequence guard for out-of-order responses |
-| SSR hydration safety | `getServerSnapshot` backed by `store.initial` (cached per hook — stable references) |
-| `__NEXT_DATA__` fragility | **Removed.** It was a Pages Router internal and never fires under the App Router. Replaced by explicit `<BridgeSignal>` in the RSC tree — documented, streaming-safe, and testable |
-| Functional reducers | Reducer contract `(payload, state) => next`; same-reference returns skip notification |
-| Transaction identifiers | Signal `id` (replay dedupe) + per-`execute` sequence numbers (ordering) |
-| Optimistic updates | `execute(promise, { optimistic })` with rollback on reject / `ok: false` |
-
-Two v11 bugs fixed in passing:
-
-- `send`'s payload was typed as the handler's whole `Parameters` tuple (`[payload, state]`), so the README's own example didn't type-check. Now `PayloadOf<H, A>` extracts the first parameter.
-- The library was one `'use client'` monolith, but `store.send` is called inside `'use server'` files, and the store was passed as a prop from a server layout — both boundary violations at runtime. Hence the core/client split and the providers-file pattern.
-
 ## Testing
 
 `npm test` runs the core suite (17 tests): action/state semantics, per-slice notification isolation, no-op change detection, signal serialization round-trip, ingest replay dedupe, and the full `execute` matrix — out-of-order responses, optimistic apply, rollback on reject, rollback on `ok: false`.
 
 `npm run check` type-checks the library, the demo app, **and** [`test/types.check.ts`](test/types.check.ts), a compile-time contract: every `@ts-expect-error` in it must stay an error, so inference regressions fail CI.
 
-Still to add (the "ruthless suite" blueprint):
+Still to add:
 
 - **Render-count assertions** — `@testing-library/react` + jsdom: assert a selector component records exactly one render when an unrelated property in its slice updates.
 - **E2E network simulation** — Playwright: 2s-delayed Server Action, assert loading state, rollback on failure, and no flicker on out-of-order resolution.
