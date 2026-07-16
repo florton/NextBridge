@@ -135,14 +135,22 @@ function withTimeout<T>(pending: Promise<T>, ms: number, key: string): Promise<T
 }
 
 /**
- * Wraps a Zustand store so it can receive server signals. Returns the same
- * store with `.ingest` and `.execute` added — pass it to `<BridgeProvider>`
- * and read it with Zustand's own `useStore(store, selector)`.
+ * Wraps a Zustand store so it can receive server signals. Returns a *new*
+ * object — your store, plus `.ingest` and `.execute` — which you pass to
+ * `<BridgeProvider>` and read with Zustand's own `useStore(store, selector)`.
+ *
+ * The input store is left untouched: a Zustand store is a plain object of
+ * closures over shared state, so the copy drives the same state while the
+ * original stays a plain `StoreApi`. Attaching twice therefore yields two
+ * independent channels rather than one silently clobbering the other.
+ *
+ * `S` is preserved in the return type, so anything your middleware added
+ * (`persist`, `devtools`, …) survives in both the value and its type.
  */
-export function attachBridge<State, P>(
-  store: StoreApi<State>,
+export function attachBridge<State, P, S extends StoreApi<State> = StoreApi<State>>(
+  store: S,
   bridge: Bridge<State, P>,
-): BridgedStore<State, P> {
+): S & BridgeApi<P> {
   const seen = new Set<string>();
   /** key → seq of the newest response applied, for `last-wins`. */
   const applied = new Map<string, number>();
@@ -150,6 +158,16 @@ export function attachBridge<State, P>(
   const chains = new Map<string, Promise<void>>();
   let opSeq = 0;
   const reducers = bridge.reducers as Record<string, Reducer<State>>;
+
+  // Zustand's devtools middleware reads a third argument as the action label,
+  // so every server-driven update shows up named in Redux DevTools instead of
+  // as an anonymous setState. A plain store ignores it, so this costs nothing
+  // either way. `StoreApi`'s public type stops at two params, hence the cast.
+  const setState = store.setState as unknown as (
+    partial: Partial<State> | ((state: State) => Partial<State>),
+    replace?: false,
+    action?: string,
+  ) => void;
 
   function apply(sig: AnySignal): void {
     const reducer = reducers[sig.type];
@@ -159,7 +177,7 @@ export function attachBridge<State, P>(
     }
     // Functional setState → reducer sees live state at execution time, so
     // rapid signals can't overwrite each other with stale reads.
-    store.setState((state) => reducer(sig.payload, state));
+    setState((state) => reducer(sig.payload, state), false, sig.type);
   }
 
   /**
@@ -182,8 +200,10 @@ export function attachBridge<State, P>(
     for (const key of Object.keys(patch) as (keyof State)[]) {
       before[key] = state[key];
     }
-    store.setState(patch);
-    return () => store.setState(before);
+    // Labelled so an optimistic patch and its rollback are both legible in the
+    // devtools timeline, rather than two mystery writes.
+    setState(patch, false, `${sig.type} (optimistic)`);
+    return () => setState(before, false, `${sig.type} (rollback)`);
   }
 
   function ingest(signal: SignalOf<P> | SignalOf<P>[] | null | undefined): void {
@@ -284,7 +304,10 @@ export function attachBridge<State, P>(
   // `execute` is written as one permissive signature; the public type is the
   // overload pair on BridgeApi, which is what enforces `ok` with `optimistic`.
   const api: BridgeApi<P> = { ingest, execute: execute as BridgeApi<P>['execute'] };
-  return Object.assign(store, api);
+  // Spread, not Object.assign: mutating the caller's store would make the
+  // input silently grow methods its type doesn't declare, and a second
+  // attachBridge would overwrite the first's channel in place.
+  return { ...store, ...api } as S & BridgeApi<P>;
 }
 
 // ---------------------------------------------------------------------------

@@ -85,8 +85,44 @@ Without `optimistic` there's nothing to roll back, so `ok` stays optional. A thr
 
 ```tsx
 // any Server Component → client, no framework internals
+<BridgeSignal signal={appBridge.send('notice/show', { text: 'Payment received' })} />
+```
+
+### Signals are for events, not initial data
+
+Signals apply in an effect — **after hydration**. For an event that's exactly right: a payment confirmation hasn't happened at first paint, so there's no earlier value it could have had.
+
+For data the server already knew, it's a bug. The HTML ships the *stale* value and stays visibly wrong until JS downloads, parses, and hydrates — seconds on a mid-range phone, since hydration is CPU-bound as much as network-bound. It stays wrong permanently for crawlers, link unfurls, and any page where a script throws. Then it flips, which users read as jank:
+
+```tsx
+// ✗ `plan` is a fact the server already knew. This renders "free", then
+//   corrects itself to "pro" after hydration.
 <BridgeSignal signal={appBridge.send('user/setPlan', { plan })} />
 ```
+
+This isn't a tradeoff you pay to avoid — the alternatives are *less* code:
+
+| The data is… | Use | Why |
+|---|---|---|
+| Known by the server, needed by a component at first paint | **RSC prop** | Correct in the first byte; no store, no client JS |
+| Known by the server, needed by the *store* at first paint | **Seed `Providers initialState`** | Client components render on the server too, so the store is built during SSR already correct — and hydration matches |
+| Something that *happened* after the page exists | **`BridgeSignal`** | Post-hydration timing is the right semantics |
+
+Nothing in the library can fix this: applying a signal during render would mean mutating an external store mid-render, which React forbids (it breaks concurrent rendering) and which would be order-dependent — components above the signal would read the old value, ones below the new one, producing inconsistent HTML. Post-hydration is architectural.
+
+The rule of thumb: **the store holds client state; the server's own data belongs in props or the seed.** Pulling server-authoritative data into a client store is how you end up with two sources of truth that drift — the problem TanStack Query exists to manage.
+
+### Devtools
+
+If your store uses Zustand's `devtools` middleware, every server-driven update arrives **named** in Redux DevTools rather than as an anonymous `setState`:
+
+```
+cart/add
+user/rename (optimistic)
+user/rename (rollback)
+```
+
+Nothing to configure — the bridge passes the signal type as the action label, and a store without the middleware ignores it.
 
 ## What this buys over standalone-store next-bridge
 
