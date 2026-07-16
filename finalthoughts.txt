@@ -1,0 +1,63 @@
+Safe / secure?
+Mostly yes on the client, with one real hazard on the server.
+
+The client story is clean: signals are plain JSON routed through a Map lookup by string key (core.ts), so there's no prototype-pollution surface even with hostile type strings, unknown signals are dropped with a warning rather than crashing, and the replay seen set is bounded. Nothing here is a security liability in the browser. One thing to internalize: handler payloads that originate from user input and get reflected back through a server action are untrusted data — treat them like any other state input (don't shove them into dangerouslySetInnerHTML downstream). That's not special to this library, but the "server sends a signal" pattern makes it easy to forget the payload may have started as user input.
+
+The hazard: createStore holds mutable state at module scope, and store.actions / dispatch / execute are all exported from the server-safe core. The whole design is only leak-free because writes are supposed to happen client-side only — the server just reads initial and calls the pure send. But nothing enforces that invariant. The day someone writes appStore.actions.user.rename(...) inside a server action or server component, they mutate a singleton shared across every request and every user on that server instance — a cross-request data-bleed bug, and a nasty one because it's intermittent and load-dependent. This is precisely the trap Zustand's Next.js guide tells people to avoid by creating a per-request store. Right now your library ships the anti-pattern as the happy path and relies on discipline to stay safe.
+
+If you keep the singleton ergonomics, I'd harden it: detect a server environment in dispatch/execute and throw ("next-bridge: stores are client-write-only; use send() on the server"). That converts a silent production leak into a loud dev-time error and makes the security claim actually enforceable rather than aspirational.
+
+Scalable?
+On the axis it controls, fine; but it doesn't touch the axes that actually hurt. Dispatch is O(1), subscriptions are per-slice, the internal bookkeeping is bounded. Client-side it'll scale to a large component tree without re-render storms. But "scalable" for a Next app usually means server load, data fetching, and caching — this library is orthogonal to all of that, so it neither helps nor hurts there. Architecturally, a single global store is itself a mild scaling drag in big apps (state doesn't code-split cleanly, features couple to one store instance); that's a known global-store tradeoff, not unique to you.
+
+Does it solve the real boundary pain points?
+Partially, and it's worth being precise about which ones, because Next already solved several:
+
+Server → client data: already solved by RSC props with zero library. Not a pain point.
+Server Action → typed result: already solved by useActionState. Not a pain point.
+The actual gap: applying a server action's result to global client state that distant components share, without prop-drilling or lifting state up — and letting a Server Component push into that store. That's a real ergonomic gap, and execute() + <BridgeSignal> fill it nicely. <BridgeSignal> in particular has no clean vanilla equivalent (you'd hand-roll a prop + effect-into-store dance).
+So it solves a real but narrower problem than "callbacks/setters/event handlers across the boundary" implies. The honest comparison isn't against vanilla — it's against Zustand, which already gives you useSyncExternalStore, selectors, out-of-React access, ~1kb, SSR docs, devtools, and years of production hardening. Your differentiator is the signal serialization contract (send/execute/BridgeSignal) — a genuinely good idea, but one you could layer onto Zustand in ~30 lines while keeping its ecosystem and battle-testing. Building the store from scratch means re-earning all of that yourself.
+
+More or less efficient than vanilla?
+Depends entirely on your baseline:
+
+vs. React Context for global mutable state: more efficient — you avoid Context's re-render-all-consumers problem. Real win.
+vs. Zustand/Jotai: a wash. Same underlying primitive.
+vs. idiomatic vanilla (RSC props + useActionState + local/URL state): slightly less efficient for initial data. Signals apply post-hydration in an effect, so signal-driven state costs an extra render after hydration and can flash initial→correct. RSC props are correct at first paint with zero extra render. You've documented this honestly in the Semantics section — just know it means "use signals for events and cache-sync, not initial data" is a load-bearing rule, not a footnote.
+Bundle cost (+1.4kb) is noise.
+
+Where I land
+Ship it as an opinion, not a default. Developers benefit specifically when they have global client state that multiple distant components read and server actions need to update — then the signal contract is cleaner than hand-wiring Zustand. Outside that scenario, vanilla is simpler and more correct-at-first-paint, and inside it, Zustand is the safer incumbent. Before I'd call it production-ready I'd want: (1) the server-write guard above — that's the one thing that's currently a genuine security bug waiting to happen, and (2) the render-count and E2E tests the README already lists as pending, since "only re-renders when the value changes" and "drops out-of-order responses" are the two claims most likely to regress silently. The race-protection and optimistic-rollback logic is thoughtful, but optimistic rollback is last-write-wins over the whole slice, so concurrent optimistic updates on the same slice can clobber each other — fine if you scope actions to the state they own, worth a caveat in the docs.
+
+Yes — and the fact that it started as a Zustand getter/setter generator actually points straight at where this should go. Let me lay out what exists, then make a concrete recommendation, because I think the "fork vs extend vs rewrite" question has a clear answer and it's not the path you're currently on.
+
+The server→client problem already has two established answers
+The App Router ecosystem splits into two philosophies, and it's worth being precise about which one you're competing with:
+
+Camp 1 — refetch/revalidate (Next-native). You mutate on the server, call revalidatePath/revalidateTag (or router.refresh()), and the RSC tree re-renders with fresh server data. The server stays the single source of truth; the client never manually syncs. For "I saved a thing, now show the updated thing," this is the idiomatic zero-library answer, and it's genuinely hard to beat on correctness because there's no client state to drift.
+
+Camp 2 — push/patch (what next-bridge does). The server hands back an instruction and the client patches local state directly, no refetch. This is not new either:
+
+TanStack Query: useMutation({ onSuccess: (data) => queryClient.setQueryData(key, patch) }) is structurally identical to your execute(action) → apply signal. It also gives you optimistic updates with rollback, request dedup, and out-of-order handling — the exact three guarantees you built.
+Redux: dispatching an action returned from a server call is the original version of this pattern (next-redux-wrapper built a whole hydration story around it).
+React 19 built-ins: useActionState returns typed server-action results to the caller, and useOptimistic does optimistic-with-auto-revert natively. Between them they cover the single-component case with zero library.
+So the honest read: the concept of a server→client back-channel is solved several times over. Your send/execute/BridgeSignal triad isn't a new capability — it's a more typed, more minimal, more Next-boundary-aware packaging of it. That packaging is the value, not the mechanism.
+
+Where next-bridge can actually shine
+Three things the incumbents don't do well, which you can own:
+
+End-to-end type safety across the boundary. appStore.send('user', 'rename', {name}) being fully checked inside a Server Action against the client's handler signatures — wrong slice/action/payload fails tsc — is something neither Zustand, TanStack, nor the React built-ins give you. This is your crown jewel. useActionState types the return value but nothing types "the instruction the server emits for the client store." You do.
+Transport-agnostic server push — this is the big one. You already have ingest() documented for "SSE/WS." Neither Zustand nor TanStack has a clean, typed story for "a websocket streams deltas and they patch client state with dedup + ordering already handled." Real-time dashboards, collaborative UIs, live prices, notifications — that's a real, underserved niche, and your dedup-by-id + sequence-guard machinery is exactly what that needs. If I were picking one thing to build the whole product around, it's "typed server-push state sync for Next," with Server Actions and RSC as just two of the transports.
+Boilerplate-free actions — your original library's DNA. Zustand makes you hand-write setters. You could auto-derive trivial setX reducers from the initial state (your getter/setter-gen heritage) while still allowing custom ones. That's a concrete ergonomic win over raw Zustand.
+The strategic recommendation: extend Zustand, don't replace it
+Your original instinct to fork/extend was the right one. Here's why the rewrite works against you:
+
+Everything risky in a from-scratch store is the store mechanics — per-request SSR isolation, devtools, persistence, middleware. That's precisely where you currently have the singleton footgun I flagged (server-side writes leak across requests), and it's exactly what Zustand already solved years ago with its per-request store factory + hydration pattern. By reimplementing the store, you're re-earning all of that — and getting the SSR isolation wrong on the first pass proves how easy it is to get wrong.
+
+Meanwhile, none of your actual value lives in the store mechanics. It lives in the boundary layer: the typed signal contract, execute, ingest, optimistic/ordering. So split the product along that seam:
+
+send() stays a standalone, zero-dependency, server-safe function that just builds typed signals. This is the piece that has to be importable in Server Actions, and it needs neither React nor Zustand. Keep it exactly as pure as it is now.
+The client half becomes a Zustand middleware / companion — bridge() — that adds execute, ingest, BridgeSignal, dedup, and ordering to any Zustand store. You inherit per-request isolation, devtools, persist, and immer for free, and the footgun disappears because you're using Zustand's blessed store-factory pattern.
+That repositions you cleanly: you're not a state manager competing with Zustand — you're the typed server/client boundary layer Zustand is missing. That's a sentence a developer immediately understands and doesn't have to be talked out of ("why not just use Zustand?"), because the answer is "you do use Zustand — this makes it Next-aware." It's a much easier sell than a from-scratch store that has to out-argue the incumbent on its own turf.
+
+The one reason to stay independent is avoiding a peer-dep on Zustand and keeping the bundle self-contained. Given this literally started as a Zustand extension and you already prefer Zustand, I don't think that outweighs inheriting its entire battle-tested foundation — but if you want zero coupling, the fallback is to keep your own tiny store and copy Zustand's per-request factory pattern (context-provided store instance, not a module singleton) so the security model is correct.
