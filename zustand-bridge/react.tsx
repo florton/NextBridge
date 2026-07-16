@@ -8,7 +8,7 @@
  * factory exactly as-is — this only adds the server→client channel.
  */
 
-import { createContext, useContext, useEffect, useRef, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, type ReactNode } from 'react';
 import type { StoreApi } from 'zustand';
 import { devWarn, type AnySignal, type Bridge, type Reducer, type SignalOf } from './core';
 
@@ -147,13 +147,15 @@ function withTimeout<T>(pending: Promise<T>, ms: number, key: string): Promise<T
  * `S` is preserved in the return type, so anything your middleware added
  * (`persist`, `devtools`, …) survives in both the value and its type.
  */
-export function attachBridge<State, P, S extends StoreApi<State> = StoreApi<State>>(
+export function withBridge<State, P, S extends StoreApi<State> = StoreApi<State>>(
   store: S,
   bridge: Bridge<State, P>,
 ): S & BridgeApi<P> {
   const seen = new Set<string>();
   /** key → seq of the newest response applied, for `last-wins`. */
   const applied = new Map<string, number>();
+  /** key → how many `last-wins` ops are still in flight, so `applied` can be dropped. */
+  const racing = new Map<string, number>();
   /** key → tail of that key's serialized chain, for `queue`. */
   const chains = new Map<string, Promise<void>>();
   let opSeq = 0;
@@ -248,10 +250,10 @@ export function attachBridge<State, P, S extends StoreApi<State> = StoreApi<Stat
       );
     }
 
-    if (result?.ok === false) {
-      rollback?.();
-      return result;
-    }
+    // A failed action rolls back its optimistic patch — but its signal still
+    // applies below. Failures routinely carry one (an error notice, or the
+    // server's authoritative value), and returning early swallowed it.
+    if (result?.ok === false) rollback?.();
 
     // last-wins only: a newer response for this key already landed.
     if (o.key && o.seq !== undefined) {
@@ -269,13 +271,36 @@ export function attachBridge<State, P, S extends StoreApi<State> = StoreApi<Stat
   ): Promise<R> {
     // Optimistic applies now, not when the slot opens — a queued click still
     // gets instant feedback while its request waits its turn.
-    const rollback = opts?.optimistic ? applyWithUndo(opts.optimistic) : null;
+    const optimistic = opts?.optimistic;
+    const rollback = optimistic ? applyWithUndo(optimistic) : null;
 
-    const key = opts?.key;
+    // An optimistic call is by definition a mutation of state we're tracking,
+    // so it needs an ordering scope — otherwise a slow earlier response can
+    // clobber the patch, which is the exact bug optimism invites. With no
+    // explicit key, fall back to the signal's own type: same-type mutations
+    // serialize, which is safe if coarse. Pass a precise key (`todo:${id}`) to
+    // let unrelated resources run in parallel, or `order: 'none'` to opt out.
+    const key = opts?.key ?? optimistic?.type;
     const order: Order = opts?.order ?? (key ? 'queue' : 'none');
 
     if (!key || order === 'none') return runOp(action, rollback, {});
-    if (order === 'last-wins') return runOp(action, rollback, { key, seq: ++opSeq });
+
+    if (order === 'last-wins') {
+      racing.set(key, (racing.get(key) ?? 0) + 1);
+      const settle = () => {
+        const left = (racing.get(key) ?? 1) - 1;
+        if (left > 0) return void racing.set(key, left);
+        // Nothing is racing for this key any more. `opSeq` only increases, so
+        // a future op always outranks every settled one and the watermark has
+        // no one left to reject — drop it rather than let the map grow for the
+        // lifetime of the session (`chains` is pruned the same way below).
+        racing.delete(key);
+        applied.delete(key);
+      };
+      const run = runOp(action, rollback, { key, seq: ++opSeq });
+      void run.then(settle, settle);
+      return run;
+    }
 
     // queue: start only once the previous op for this key has settled —
     // pass or fail, so one rejection can't strand everything behind it.
@@ -306,7 +331,7 @@ export function attachBridge<State, P, S extends StoreApi<State> = StoreApi<Stat
   const api: BridgeApi<P> = { ingest, execute: execute as BridgeApi<P>['execute'] };
   // Spread, not Object.assign: mutating the caller's store would make the
   // input silently grow methods its type doesn't declare, and a second
-  // attachBridge would overwrite the first's channel in place.
+  // withBridge would overwrite the first's channel in place.
   return { ...store, ...api } as S & BridgeApi<P>;
 }
 
@@ -343,12 +368,16 @@ export function BridgeProvider({
 export function BridgeSignal({ signal }: { signal: AnySignal | AnySignal[] | null }) {
   const store = useContext(StoreContext);
   const idKey = Array.isArray(signal) ? signal.map((s) => s.id).join('|') : (signal?.id ?? '');
-  const ref = useRef(signal);
-  ref.current = signal;
 
   useEffect(() => {
     if (!store) return devWarn('<BridgeSignal> outside <BridgeProvider> — signal dropped.');
-    store.ingest(ref.current);
+    store.ingest(signal);
+    // `signal` is deliberately not a dependency: a Server Component mints a
+    // fresh object on every render, so depending on identity would re-run this
+    // constantly. `idKey` is the real identity, and the effect closes over the
+    // signal from the render it was committed with — which is exactly why no
+    // ref is needed here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [store, idKey]);
 
   return null;

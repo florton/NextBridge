@@ -51,29 +51,29 @@ export type Reducers<State, P> = {
   [K in keyof P]: (payload: P[K], state: State) => Partial<State>;
 };
 
-type UnionToIntersection<U> = (U extends any ? (x: U) => void : never) extends (
-  x: infer I,
-) => void
-  ? I
-  : never;
+/** `[]` for void-payload signals, so `send('cart/clear')` takes no second arg. */
+type PayloadArgs<T> = [T] extends [void | undefined] ? [] : [payload: T];
 
 /**
- * One call signature per signal type, intersected into a single overloaded
- * function. Each key gets its exact arity (void payloads take no second arg)
- * and its exact payload type — so no reliance on generic narrowing.
+ * Builds a signal. `K` is inferred from the first argument, which then fixes
+ * the payload's type and arity.
+ *
+ * (An earlier version generated one call signature per key and intersected
+ * them into an overload set. It worked, but TypeScript reports a bad call
+ * against an arbitrary member of an overload set — "'cart/clear' is not
+ * assignable to '\"bad/one\"'" — which is a terrible clue. A single generic
+ * signature only narrows correctly because `P` keeps its literal keys; it
+ * would collapse if `P` ever widened to `string`.)
  */
-export type SendFn<P> = UnionToIntersection<
-  {
-    [K in keyof P & string]: [P[K]] extends [void | undefined]
-      ? (type: K) => Signal<K, P[K]>
-      : (type: K, payload: P[K]) => Signal<K, P[K]>;
-  }[keyof P & string]
->;
+export type SendFn<P> = <K extends keyof P & string>(
+  type: K,
+  ...payload: PayloadArgs<P[K]>
+) => Signal<K, P[K]>;
 
 export interface Bridge<State, P> {
   /** The initial state — reused by the store factory so it's declared once. */
   initialState: State;
-  /** The shared reducer map — consumed by the client store via `attachBridge`. */
+  /** The shared reducer map — consumed by the client store via `withBridge`. */
   reducers: Reducers<State, P>;
   /**
    * Builds a typed, serializable Signal. Server-safe: call inside Server

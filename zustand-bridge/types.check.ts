@@ -8,7 +8,7 @@
  */
 import { createStore } from 'zustand/vanilla';
 import { defineBridge, type Signal } from './core';
-import { attachBridge } from './react';
+import { withBridge } from './react';
 
 interface S {
   user: { name: string; plan: 'free' | 'pro' };
@@ -54,7 +54,7 @@ bridge.send('user/rename');
 
 // ---- the RECEIVE site is typed too: the store only accepts this bridge's
 // signals, so a hand-rolled or foreign signal can't reach a reducer.
-const store = attachBridge(createStore<S>(() => initialState), bridge);
+const store = withBridge(createStore<S>(() => initialState), bridge);
 
 store.ingest(bridge.send('cart/clear'));
 store.ingest([bridge.send('user/rename', { name: 'Grace' })]);

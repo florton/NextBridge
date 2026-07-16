@@ -12,5 +12,5 @@
     "noEmit": true,
     "types": []
   },
-  "include": ["src", "demo12", "test", "zustand-bridge"]
+  "include": ["src", "demo12", "test", "zustand-bridge", "signal-bridge"]
 }

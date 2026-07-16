@@ -16,7 +16,7 @@ Everything else — selectors, `useStore`, middleware, devtools, `persist`, and 
 | File | Role | Boundary |
 |---|---|---|
 | [`core.ts`](core.ts) | `defineBridge`, `send`, `Signal` types | server-safe, zero-dep |
-| [`react.tsx`](react.tsx) | `attachBridge` (adds `execute`/`ingest`), `BridgeProvider`, `BridgeSignal` | `'use client'` |
+| [`react.tsx`](react.tsx) | `withBridge` (adds `execute`/`ingest`), `BridgeProvider`, `BridgeSignal` | `'use client'` |
 | [`demo/`](demo/bridge.ts) | contract, per-request store factory, provider, server actions, components | — |
 
 ## Shape
@@ -58,11 +58,18 @@ That's what makes `order: 'queue'` possible, and it matters more than it first l
 
 | `order` | Behaviour | Use for |
 |---|---|---|
-| `queue` (default with `key`) | Next request waits for the previous to settle | Mutations to one resource |
+| `queue` (default when `key` or `optimistic` is set) | Next request waits for the previous to settle | Mutations to one resource |
 | `last-wins` | Parallel; only the newest response applies | Type-ahead / search |
-| `none` (default without `key`) | Parallel; every response applies | Independent or accumulative work |
+| `none` (default otherwise) | Parallel; every response applies | Independent or accumulative work |
 
 `key` is the ordering scope — usually a resource identity like `todo:${id}`. Different keys never block each other, which is why ordering is keyed by resource rather than by signal type: two concurrent edits to *different* todos must not cancel one another.
+
+**Optimistic calls are ordered by default.** An optimistic patch is precisely what a slow earlier response would clobber, so if you pass `optimistic` without a `key`, the signal's own type becomes the key. Same-type mutations serialize — safe, if coarse. Pass a precise key to parallelize unrelated resources, or `order: 'none'` to opt out:
+
+```ts
+store.execute(() => saveName(draft), { optimistic: rename(draft) });                  // ordered
+store.execute(() => saveTodo(id, t), { optimistic: upd(id, t), key: `todo:${id}` });  // per-resource
+```
 
 ### Optimistic updates must declare success
 
@@ -80,6 +87,12 @@ store.execute(() => saveName(draft), {
 ```
 
 Without `optimistic` there's nothing to roll back, so `ok` stays optional. A thrown error always rolls back regardless — `ok` exists for actions that *return* their failures instead of throwing, which is the common Next.js style. JS callers who slip past the types get a dev warning rather than silence.
+
+A failure rolls back the patch but **still delivers its signal**, so an action can report what went wrong:
+
+```ts
+return { ok: false, error: 'Save failed', signal: appBridge.send('notice/show', { text: 'Save failed' }) };
+```
 
 **Head-of-line blocking** is the queue's inherent risk, so it's designed for: a queued op that exceeds `timeoutMs` (default 30s, `Infinity` disables) releases its slot, rejects with `BridgeTimeoutError`, rolls back its optimistic patch, and has its late result ignored. A rejected op doesn't strand the ops behind it, and drained keys are dropped from the internal map. The one honest limit: an in-flight Server Action can't actually be cancelled — on timeout we stop waiting, we don't stop the server.
 
@@ -134,6 +147,10 @@ Nothing to configure — the bridge passes the signal type as the action label, 
 
 The natural extension is a **real-time transport**: `ingest()` already accepts externally-delivered signals, so a websocket/SSE stream of typed deltas would patch client state with dedupe + ordering already handled — something neither Zustand nor TanStack Query offers in a typed form. That, plus the type-safe `send()`, is the sharpest reason to pick this over rolling your own.
 
+## Packaging note
+
+Zustand is a **devDependency** of this repo, because the published package here is the standalone `next-bridge` (`files: ["src"]`), which doesn't use Zustand at all — shipping it as a runtime dependency would make every consumer install it for nothing. If this direction becomes the shipped package, Zustand moves to `peerDependencies` (`"zustand": ">=5"`), never a dependency: a library bundling its own copy risks two Zustand instances and therefore two stores.
+
 ## Status
 
-Prototype. `defineBridge` + `attachBridge` + `execute`/`ingest`/`BridgeSignal` are implemented and unit-tested ([`bridge.test.ts`](bridge.test.ts)); the typed-signal contract is locked by [`types.check.ts`](types.check.ts). Not packaged — this folder is for evaluating the approach, not publishing.
+Prototype. `defineBridge` + `withBridge` + `execute`/`ingest`/`BridgeSignal` are implemented and unit-tested ([`bridge.test.ts`](bridge.test.ts)); the typed-signal contract is locked by [`types.check.ts`](types.check.ts). Not packaged — this folder is for evaluating the approach, not publishing.

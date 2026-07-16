@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { createStore } from 'zustand/vanilla';
 import { defineBridge, type Signal } from './core';
-import { attachBridge } from './react';
+import { withBridge } from './react';
 
 interface S {
   user: { name: string };
@@ -17,7 +17,7 @@ const bridge = defineBridge(initialState, {
 });
 
 const make = () =>
-  attachBridge(
+  withBridge(
     createStore<S>(() => ({ user: { name: 'Ada' }, cart: { items: [] } })),
     bridge,
   );
@@ -158,6 +158,106 @@ describe('execute', () => {
     expect(result.error).toBe('nope');
     expect(store.getState().user.name).toBe('Ada');
   });
+
+  it('still applies the signal a failed action returns, after rolling back', async () => {
+    const store = make();
+    const result = await store.execute(
+      // A failure that carries a signal — an error notice, or the server's
+      // authoritative value. `cart/add` stands in for it here.
+      () => Promise.resolve({ ok: false as const, signal: bridge.send('cart/add', { sku: 'x' }) }),
+      { optimistic: bridge.send('user/rename', { name: 'Optimistic' }) },
+    );
+
+    expect(result.ok).toBe(false);
+    expect(store.getState().user.name).toBe('Ada'); // optimistic undone
+    expect(store.getState().cart.items).toEqual(['x']); // failure signal still delivered
+  });
+});
+
+describe('execute · optimistic defaults', () => {
+  type RenameOk = { ok: true; signal: Signal<'user/rename', { name: string }> };
+
+  it('orders optimistic mutations by default, keyed by the signal type', async () => {
+    const store = make();
+    const a = deferred<RenameOk>();
+    const b = deferred<RenameOk>();
+    const sent: string[] = [];
+
+    // Note: no `key`, no `order`. The naive call must still be protected —
+    // an optimistic patch is exactly what a racing response would clobber.
+    const first = store.execute(
+      () => {
+        sent.push('a');
+        return a.promise;
+      },
+      { optimistic: bridge.send('user/rename', { name: 'A' }) },
+    );
+    const second = store.execute(
+      () => {
+        sent.push('b');
+        return b.promise;
+      },
+      { optimistic: bridge.send('user/rename', { name: 'B' }) },
+    );
+
+    expect(sent).toEqual(['a']); // B waits, so the server can't see them out of order
+
+    a.resolve({ ok: true, signal: bridge.send('user/rename', { name: 'A' }) });
+    await first;
+    await flush();
+    expect(sent).toEqual(['a', 'b']);
+
+    b.resolve({ ok: true, signal: bridge.send('user/rename', { name: 'B' }) });
+    await second;
+    expect(store.getState().user.name).toBe('B');
+  });
+
+  it('lets an explicit key parallelize unrelated resources', () => {
+    const store = make();
+    const sent: string[] = [];
+
+    void store.execute(
+      () => {
+        sent.push('todo:1');
+        return deferred<RenameOk>().promise;
+      },
+      { optimistic: bridge.send('user/rename', { name: 'A' }), key: 'todo:1' },
+    );
+    void store.execute(
+      () => {
+        sent.push('todo:2');
+        return deferred<RenameOk>().promise;
+      },
+      { optimistic: bridge.send('user/rename', { name: 'B' }), key: 'todo:2' },
+    );
+
+    // Same signal type, different resources — the type-keyed default would
+    // have serialized these needlessly.
+    expect(sent).toEqual(['todo:1', 'todo:2']);
+  });
+
+  it('honours an explicit opt-out', () => {
+    const store = make();
+    const sent: string[] = [];
+    const opts = { order: 'none' } as const;
+
+    void store.execute(
+      () => {
+        sent.push('a');
+        return deferred<RenameOk>().promise;
+      },
+      { ...opts, optimistic: bridge.send('user/rename', { name: 'A' }) },
+    );
+    void store.execute(
+      () => {
+        sent.push('b');
+        return deferred<RenameOk>().promise;
+      },
+      { ...opts, optimistic: bridge.send('user/rename', { name: 'B' }) },
+    );
+
+    expect(sent).toEqual(['a', 'b']);
+  });
 });
 
 describe('execute · order: queue', () => {
@@ -280,6 +380,38 @@ describe('execute · order: last-wins', () => {
     slow.resolve({ signal: bridge.send('user/rename', { name: 'STALE' }) });
     await first;
 
+    expect(store.getState().user.name).toBe('NEW');
+  });
+
+  it('forgets a key once nothing is racing on it, so the watermark map drains', async () => {
+    const store = make();
+    const opts = { key: 'user', order: 'last-wins' } as const;
+
+    await store.execute(
+      () => Promise.resolve({ signal: bridge.send('user/rename', { name: 'A' }) }),
+      opts,
+    );
+    await flush();
+
+    // With the bookkeeping dropped, a later op on the same key must still
+    // apply — `opSeq` only ever increases, so it outranks anything settled.
+    // (If the watermark leaked instead of draining, this still passes; the
+    // point is that draining doesn't break correctness.)
+    await store.execute(
+      () => Promise.resolve({ signal: bridge.send('user/rename', { name: 'B' }) }),
+      opts,
+    );
+    expect(store.getState().user.name).toBe('B');
+
+    // And a genuine race on that key is still caught after a drain.
+    const slow = deferred<RenameResult>();
+    const fast = deferred<RenameResult>();
+    const first = store.execute(() => slow.promise, opts);
+    const second = store.execute(() => fast.promise, opts);
+    fast.resolve({ signal: bridge.send('user/rename', { name: 'NEW' }) });
+    await second;
+    slow.resolve({ signal: bridge.send('user/rename', { name: 'STALE' }) });
+    await first;
     expect(store.getState().user.name).toBe('NEW');
   });
 

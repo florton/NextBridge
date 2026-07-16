@@ -11,7 +11,7 @@ import { act, cleanup, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createStore } from 'zustand/vanilla';
 import { devtools, persist } from 'zustand/middleware';
-import { BridgeSignal, attachBridge } from './react';
+import { BridgeSignal, withBridge } from './react';
 import { appBridge, type AppState } from './demo/bridge';
 import { Providers, useApp } from './demo/provider';
 
@@ -138,12 +138,12 @@ describe('<BridgeSignal>', () => {
   });
 });
 
-describe('attachBridge', () => {
+describe('withBridge', () => {
   it('leaves the caller store untouched and keeps its middleware API', () => {
     const plain = createStore<AppState>()(
       persist(() => appBridge.initialState, { name: 'zb-attach-test' }),
     );
-    const bridged = attachBridge(plain, appBridge);
+    const bridged = withBridge(plain, appBridge);
 
     // A new object — the input is not mutated into something its type denies.
     expect(bridged).not.toBe(plain);
@@ -159,15 +159,15 @@ describe('attachBridge', () => {
     expect(bridged.getState().cart.items).toEqual(['a']);
   });
 
-  it('gives each attach an independent channel rather than clobbering the last', () => {
+  it('gives each call an independent channel rather than clobbering the last', () => {
     const plain = createStore<AppState>(() => appBridge.initialState);
-    const first = attachBridge(plain, appBridge);
-    const second = attachBridge(plain, appBridge);
+    const first = withBridge(plain, appBridge);
+    const second = withBridge(plain, appBridge);
 
     expect(first.ingest).not.toBe(second.ingest);
 
-    // Replay guards are per-attach, so the same signal id applies once per
-    // channel — the second attach hasn't silently taken over the first.
+    // Replay guards are per-channel, so the same signal id applies once per
+    // channel — the second call hasn't silently taken over the first.
     const signal = appBridge.send('cart/add', { sku: 'a' });
     first.ingest(signal);
     first.ingest(signal); // deduped within its own channel
@@ -197,7 +197,7 @@ describe('devtools labels', () => {
 
   it('names every server-driven update, instead of anonymous setState entries', async () => {
     const { actions, restore } = mockExtension();
-    const store = attachBridge(
+    const store = withBridge(
       createStore<AppState>()(devtools(() => appBridge.initialState)),
       appBridge,
     );
