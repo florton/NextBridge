@@ -80,7 +80,7 @@ export function useSignalStream(
   opts: ConnectOptions & { enabled?: boolean } = {},
 ): void {
   const receiver = useReceiver();
-  const { enabled = true, withCredentials, EventSourceImpl, onOpen, onError } = opts;
+  const { enabled = true, withCredentials, EventSourceImpl, onOpen, onError, cursorParam, reconnect } = opts;
 
   useEffect(() => {
     if (!enabled) return;
@@ -89,9 +89,11 @@ export function useSignalStream(
       EventSourceImpl,
       onOpen,
       onError,
+      cursorParam,
+      reconnect,
     });
     // Callbacks are intentionally excluded: a caller passing inline functions
     // would otherwise tear down and rebuild the connection on every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [receiver, url, enabled, withCredentials, EventSourceImpl]);
+  }, [receiver, url, enabled, withCredentials, EventSourceImpl, cursorParam, reconnect]);
 }

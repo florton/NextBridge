@@ -33,7 +33,8 @@ export interface Receiver<P> {
   /**
    * Applies one *untrusted* value off the wire: validates the envelope
    * against the contract, then ingests. Returns whether it was applied, so a
-   * transport can count drops. Never throws on junk.
+   * transport can count drops. Never throws: junk is dropped, and a throwing
+   * reducer is contained rather than escaping into a transport's handler.
    */
   accept(raw: unknown): boolean;
   /**
@@ -68,15 +69,25 @@ export function createReceiver<State, P>(
     }
     if (sig.id) {
       // A replayed id is a no-op, not an error: reconnects and Strict Mode
-      // both legitimately deliver the same signal twice.
+      // both legitimately deliver the same signal twice. Marked seen *before*
+      // applying — deliberately, so a reducer that throws deterministically
+      // is not retried on every replay of the same id.
       if (seen.has(sig.id)) return false;
       seen.add(sig.id);
       if (seen.size > SEEN_LIMIT) seen.delete(seen.values().next().value!);
-      last = sig.id;
     }
-    // Read state at apply time so a burst of signals can't overwrite each
-    // other from a stale snapshot.
-    target.setState(reducer(sig.payload, target.getState()), sig.type);
+    try {
+      // Read state at apply time so a burst of signals can't overwrite each
+      // other from a stale snapshot.
+      target.setState(reducer(sig.payload, target.getState()), sig.type);
+    } catch (error) {
+      // One bad signal must not kill the batch or escape into a transport's
+      // message handler. The delta is lost; the cursor stays put — `last`
+      // never claims a signal that didn't apply, so a resume can replay it.
+      devWarn(`Reducer for "${sig.type}" threw; signal ${sig.id || '(no id)'} dropped. ${String(error)}`);
+      return false;
+    }
+    if (sig.id) last = sig.id;
     return true;
   }
 

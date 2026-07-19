@@ -103,9 +103,11 @@ useSignalStream('/api/stream'); // connected while mounted
 
 **Why SSE, not websockets.** SSE rides plain HTTP: no second server, it works from an ordinary Route Handler, it reconnects on its own, and it has a resume cursor built into the protocol. `Signal.id` doubles as the SSE `id:`, so the browser replays it as `Last-Event-ID` and your handler resumes from exactly where the client left off. Overlap on reconnect is absorbed by the receiver's replay guard, so a generous replay window is safe. (A websocket transport is a small addition — it only needs to call `receiver.accept(frame)`.)
 
+**Production posture is built in.** The server flushes a comment immediately (so buffering proxies release the stream), heartbeats every 15s (so idle timeouts don't kill the connection, and a silently vanished client is *noticed* instead of leaking its subscription), and closes a stream whose client has stalled past a buffer bound — safe, because closing just triggers reconnect-and-resume. The client covers the two cases EventSource won't: it carries `receiver.lastId()` as a `?lastEventId=` query param, so *fresh* connections (a remount, a restored tab) resume too, not just automatic retries — and when EventSource fails permanently (an expired session, a deploy), it rebuilds the connection with capped, jittered backoff. All of it is tunable: `heartbeatMs`, `maxBufferedFrames`, `cursorParam`, `reconnect`, and `onError` reports `{ fatal }` so you can tell a blip from a dead stream.
+
 ## Trust and the wire
 
-`ingest` takes signals you already trust (your own `send`, a Server Action's result). `accept` takes **untrusted** values off the wire and validates the envelope against the contract — unknown types, junk, and prototype-shaped strings are dropped, never thrown.
+`ingest` takes signals you already trust (your own `send`, a Server Action's result). `accept` takes **untrusted** values off the wire and validates the envelope against the contract — unknown types, junk, prototype-shaped strings, and malformed ids (empty, over 256 chars, or containing line breaks, which would corrupt SSE framing) are dropped, never thrown. A reducer that throws is contained too: the batch continues, the cursor doesn't advance past the failed signal, and a replay of the same id doesn't retry it.
 
 **Payload shape is not validated at runtime.** Signals come from your own server, so this trusts them exactly as much as you already trust your own API responses. If a stream is reachable by untrusted parties, validate payloads yourself (zod et al) before calling `ingest`.
 
@@ -129,12 +131,12 @@ This isn't a tradeoff you pay to avoid — the alternatives are *less* code.
 | `bridge.send(type, payload?)` | server-safe | Typed signal factory |
 | `bridge.parse(raw)` | server-safe | Envelope validation for untrusted input |
 | `createReceiver(bridge, target)` | any runtime | `ingest` / `accept` / `lastId` |
-| `signalStream(request, start)` | server | SSE `Response` for a Route Handler |
-| `connectSignalStream(receiver, url)` | client | Returns a disconnect function |
+| `signalStream(request, start, options?)` | server | SSE `Response` for a Route Handler — heartbeat, backpressure, resume built in |
+| `connectSignalStream(receiver, url, options?)` | client | Returns a disconnect function; resumes fresh connections, rebuilds on fatal errors |
 | `SignalProvider` / `useSignalStream` / `BridgeSignal` | `'use client'` | React helpers |
 
 ## Status
 
-Prototype, and untested against a running Next server — the suite covers the contract, the receiver, and a real server → SSE wire → client round trip, but jsdom and `renderToString` are not streaming RSC. Next up: a websocket transport, React tests for `useSignalStream`, and pointing it at a live app.
+Prototype, and untested against a running Next server — the suite covers the contract, the receiver (including throw containment), the stream's lifecycle (heartbeat, backpressure, abort, resume via header and query param), a reconnecting client, and a real server → SSE wire → client round trip, but jsdom and `renderToString` are not streaming RSC. Next up: a websocket transport, React tests for `useSignalStream`, and pointing it at a live app.
 
 Related experiments in this repo: [`../zustand-bridge`](../zustand-bridge/README.md) (this plus a Zustand-coupled mutation layer) and [`../src`](../src/core.ts) (a from-scratch store). This folder is the focused version — the other two overlap with TanStack Query on purpose, and lost.

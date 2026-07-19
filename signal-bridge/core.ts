@@ -69,6 +69,9 @@ export interface Bridge<State, P> {
    * isn't a signal this bridge knows.
    *
    * Envelope only: it verifies `id`/`type` and that `type` has a reducer.
+   * Ids must be non-empty, at most 256 chars, and free of line breaks — they
+   * feed the replay guard and are echoed into SSE `id:` lines, so anything
+   * else is junk even from a trusted server.
    * Payload shape is **not** validated — signals come from your own server, so
    * this trusts them exactly as much as you already trust your own API
    * responses. If a stream is reachable by untrusted parties, validate
@@ -121,6 +124,9 @@ export function defineBridge<State, P>(
       if (!raw || typeof raw !== 'object') return null;
       const sig = raw as Partial<AnySignal>;
       if (typeof sig.id !== 'string' || typeof sig.type !== 'string') return null;
+      // Ids feed the replay guard and SSE `id:` framing: empty skips dedupe,
+      // oversized bloats the seen set, a line break injects SSE fields.
+      if (sig.id === '' || sig.id.length > 256 || /[\r\n]/.test(sig.id)) return null;
       if (!known.has(sig.type)) return null;
       return { id: sig.id, type: sig.type, payload: sig.payload } as SignalOf<P>;
     },

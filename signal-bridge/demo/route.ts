@@ -22,10 +22,12 @@ const countOnline = () => 1;
 
 export function GET(request: Request) {
   return signalStream(request, ({ emit, lastEventId }) => {
-    // Resume. EventSource replays the client's cursor as `Last-Event-ID` on
-    // reconnect, so send what it missed rather than the whole history. Any
-    // overlap is absorbed by the receiver's id dedupe, so a generous replay
-    // window is safe.
+    // Resume. `lastEventId` is the client's cursor from either channel — the
+    // `Last-Event-ID` header on an automatic EventSource retry, or the
+    // `?lastEventId=` query param that `connectSignalStream` adds to a fresh
+    // connection (a remount, a rebuilt stream). Send what the client missed
+    // rather than the whole history; any overlap is absorbed by the
+    // receiver's id dedupe, so a generous replay window is safe.
     for (const missed of backlogSince(lastEventId)) emit(missed);
 
     // `send` is type-checked here exactly as it is in a Server Action — a
@@ -34,17 +36,20 @@ export function GET(request: Request) {
       emit(appBridge.send('order/status', { status })),
     );
 
-    const heartbeat = setInterval(
+    // Real data on an interval — NOT keep-alive plumbing. The library already
+    // heartbeats comment frames on its own (see `heartbeatMs`), detects dead
+    // clients, and closes stalled streams so they reconnect and resume.
+    const presence = setInterval(
       () => emit(appBridge.send('presence/set', { online: countOnline() })),
       30_000,
     );
 
-    // Returned cleanup runs when the client disconnects. Without it you leak a
-    // subscription and a timer for every dropped connection — which, on a
-    // long-lived stream, is every connection eventually.
+    // Returned cleanup runs exactly once, however the stream ends: client
+    // disconnect, request abort, backpressure close, or close(). Without it
+    // you leak a subscription and a timer per connection.
     return () => {
       unsubscribe();
-      clearInterval(heartbeat);
+      clearInterval(presence);
     };
   });
 }

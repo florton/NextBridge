@@ -1,7 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { defineBridge, type AnySignal } from './core';
 import { createReceiver, type Target } from './receiver';
-import { signalStream } from './stream';
+import { connectSignalStream, signalStream, type StreamContext } from './stream';
 
 interface S {
   notices: string[];
@@ -69,6 +69,15 @@ describe('parse', () => {
   it('is inert against prototype-shaped types', () => {
     expect(bridge.parse({ id: '1', type: '__proto__', payload: null })).toBeNull();
     expect(bridge.parse({ id: '1', type: 'constructor', payload: null })).toBeNull();
+  });
+
+  it('rejects ids that would break the replay guard or SSE framing', () => {
+    const base = { type: 'notice/add', payload: { text: 'x' } };
+    expect(bridge.parse({ ...base, id: '' })).toBeNull(); // empty skips dedupe
+    expect(bridge.parse({ ...base, id: 'a\nb' })).toBeNull(); // injects SSE fields
+    expect(bridge.parse({ ...base, id: 'a\rb' })).toBeNull();
+    expect(bridge.parse({ ...base, id: 'x'.repeat(257) })).toBeNull(); // bloats the seen set
+    expect(bridge.parse({ ...base, id: 'x'.repeat(256) })).not.toBeNull();
   });
 });
 
@@ -139,6 +148,58 @@ describe('receiver', () => {
     expect(warn).toHaveBeenCalledOnce();
     warn.mockRestore();
   });
+
+  /** Explicit type args: no reliance on inference surviving a `never` reducer. */
+  const boomBridge = () =>
+    defineBridge<{ n: number }, { boom: void; inc: void }>(
+      { n: 0 },
+      {
+        boom: () => {
+          throw new Error('kaboom');
+        },
+        inc: (_p, s) => ({ n: s.n + 1 }),
+      },
+    );
+
+  const boomTarget = () => {
+    const box = {
+      state: { n: 0 },
+      getState: () => box.state,
+      setState: (patch: Partial<{ n: number }>) => {
+        box.state = { ...box.state, ...patch };
+      },
+    };
+    return box;
+  };
+
+  it('contains a throwing reducer: the batch survives and a replay does not retry it', () => {
+    const b = boomBridge();
+    const target = boomTarget();
+    const receiver = createReceiver(b, target);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const boom = b.send('boom');
+    const inc = b.send('inc');
+    receiver.ingest([boom, inc]); // the throw must not abort the batch
+    expect(target.state.n).toBe(1);
+    expect(receiver.lastId()).toBe(inc.id);
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    receiver.ingest(boom); // replayed failed id: already seen, so no retry storm
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+
+  it('does not advance the cursor past a signal that failed to apply', () => {
+    const b = boomBridge();
+    const receiver = createReceiver(b, boomTarget());
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    receiver.ingest(b.send('boom'));
+    // Claiming this id would make a resume skip a delta that never applied.
+    expect(receiver.lastId()).toBeUndefined();
+    warn.mockRestore();
+  });
 });
 
 describe('signalStream', () => {
@@ -162,7 +223,7 @@ describe('signalStream', () => {
     });
 
     const body = await drain(res);
-    expect(body).toBe(`id: ${sig.id}\ndata: ${JSON.stringify(sig)}\n\n`);
+    expect(body).toBe(`: ok\n\nid: ${sig.id}\ndata: ${JSON.stringify(sig)}\n\n`);
   });
 
   it('exposes the client cursor on reconnect', () => {
@@ -205,6 +266,248 @@ describe('signalStream', () => {
       close();
       expect(() => emit(bridge.send('notice/clear'))).not.toThrow();
     });
-    expect(await drain(res)).toBe('');
+    // Only the open-flush comment made it out before close.
+    expect(await drain(res)).toBe(': ok\n\n');
+  });
+
+  it('emits heartbeat comments so intermediaries see traffic and dead clients get noticed', async () => {
+    let ctx!: StreamContext;
+    const res = signalStream(new Request('http://x/stream'), (c) => void (ctx = c), {
+      heartbeatMs: 5,
+    });
+    const reader = res.body!.getReader();
+    const dec = new TextDecoder();
+    expect(dec.decode((await reader.read()).value)).toBe(': ok\n\n');
+    expect(dec.decode((await reader.read()).value)).toBe(': hb\n\n');
+    ctx.close();
+    expect((await reader.read()).done).toBe(true);
+  });
+
+  it('reads the resume cursor from the query param when the header is absent', () => {
+    const seen: (string | undefined)[] = [];
+    signalStream(new Request('http://x/stream?lastEventId=sig-7'), ({ lastEventId, close }) => {
+      seen.push(lastEventId);
+      close();
+    });
+    expect(seen).toEqual(['sig-7']);
+  });
+
+  it('prefers the Last-Event-ID header over the query param — the header is fresher', () => {
+    const seen: (string | undefined)[] = [];
+    const req = new Request('http://x/stream?lastEventId=stale', {
+      headers: { 'Last-Event-ID': 'fresh' },
+    });
+    signalStream(req, ({ lastEventId, close }) => {
+      seen.push(lastEventId);
+      close();
+    });
+    expect(seen).toEqual(['fresh']);
+  });
+
+  it('runs cleanup when the server itself ends the stream', async () => {
+    const cleanup = vi.fn();
+    const res = signalStream(new Request('http://x/stream'), ({ close }) => {
+      close(); // synchronous close — cleanup is returned *after* this runs
+      return cleanup;
+    });
+    await drain(res);
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('runs cleanup when the request aborts', () => {
+    const cleanup = vi.fn();
+    const ac = new AbortController();
+    signalStream(new Request('http://x/stream', { signal: ac.signal }), () => cleanup);
+    ac.abort();
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('runs cleanup at most once across close, cancel, and abort', async () => {
+    const cleanup = vi.fn();
+    let ctx!: StreamContext;
+    const res = signalStream(new Request('http://x/stream'), (c) => {
+      ctx = c;
+      return cleanup;
+    });
+    ctx.close();
+    await res.body!.cancel();
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('closes the stream (with cleanup) when start() throws', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const res = signalStream(new Request('http://x/stream'), () => {
+      throw new Error('subscribe exploded');
+    });
+    expect(await drain(res)).toBe(': ok\n\n'); // clean close, not an errored body
+    expect(warn).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  it('drops a signal whose id would corrupt SSE framing', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const res = signalStream(new Request('http://x/stream'), ({ emit, close }) => {
+      emit({ id: 'evil\ndata: {"x":1}', type: 'notice/add', payload: { text: 'x' } });
+      emit(bridge.send('notice/add', { text: 'fine' }));
+      close();
+    });
+    const body = await drain(res);
+    expect(body).not.toContain('evil');
+    expect(body).toContain('fine');
+    expect(warn).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  it('closes a stalled stream past maxBufferedFrames so the client can resume', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const cleanup = vi.fn();
+    const res = signalStream(
+      new Request('http://x/stream'),
+      ({ emit }) => {
+        for (let i = 0; i < 100; i++) emit(bridge.send('notice/add', { text: String(i) }));
+        return cleanup;
+      },
+      { maxBufferedFrames: 5 },
+    );
+    expect(cleanup).toHaveBeenCalledOnce(); // guard tripped during the burst
+    const frames = (await drain(res)).split('\n\n').filter((c) => c.includes('data: '));
+    expect(frames.length).toBeLessThan(100);
+    warn.mockRestore();
+  });
+});
+
+describe('connectSignalStream', () => {
+  /** Minimal EventSource double: records instances, lets tests drive events. */
+  class FakeEventSource {
+    static instances: FakeEventSource[] = [];
+    url: string;
+    withCredentials: boolean;
+    readyState = 0;
+    closed = false;
+    onopen: (() => void) | null = null;
+    onmessage: ((event: MessageEvent) => void) | null = null;
+    onerror: ((event: Event) => void) | null = null;
+    constructor(url: string, init?: { withCredentials?: boolean }) {
+      this.url = url;
+      this.withCredentials = !!init?.withCredentials;
+      FakeEventSource.instances.push(this);
+    }
+    close() {
+      this.closed = true;
+      this.readyState = 2;
+    }
+    emitOpen() {
+      this.readyState = 1;
+      this.onopen?.();
+    }
+    emitMessage(data: string) {
+      this.onmessage?.({ data } as MessageEvent);
+    }
+    emitError(opts: { fatal: boolean }) {
+      this.readyState = opts.fatal ? 2 : 0;
+      this.onerror?.(new Event('error'));
+    }
+  }
+  const Impl = FakeEventSource as unknown as typeof EventSource;
+
+  beforeEach(() => {
+    FakeEventSource.instances = [];
+  });
+
+  it('feeds frames to the receiver and drops non-JSON without throwing', () => {
+    const { target, receiver } = make();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const off = connectSignalStream(receiver, '/api/stream', { EventSourceImpl: Impl });
+    const es = FakeEventSource.instances[0]!;
+
+    es.emitMessage(JSON.stringify(bridge.send('notice/add', { text: 'live' })));
+    expect(() => es.emitMessage('not json')).not.toThrow();
+    expect(target.state.notices).toEqual(['live']);
+
+    off();
+    expect(es.closed).toBe(true);
+    warn.mockRestore();
+  });
+
+  it('carries the resume cursor as a query param on fresh connections', () => {
+    const { receiver } = make();
+    const sig = bridge.send('notice/add', { text: 'x' });
+    receiver.ingest(sig);
+
+    connectSignalStream(receiver, '/api/stream', { EventSourceImpl: Impl })();
+    connectSignalStream(receiver, '/api/stream?tenant=a', { EventSourceImpl: Impl })();
+    expect(FakeEventSource.instances[0]!.url).toBe(`/api/stream?lastEventId=${sig.id}`);
+    expect(FakeEventSource.instances[1]!.url).toBe(`/api/stream?tenant=a&lastEventId=${sig.id}`);
+  });
+
+  it('leaves the url alone with no cursor yet, or with cursorParam: false', () => {
+    const { receiver } = make();
+    connectSignalStream(receiver, '/api/stream', { EventSourceImpl: Impl })();
+    receiver.ingest(bridge.send('notice/add', { text: 'x' }));
+    connectSignalStream(receiver, '/api/stream', { EventSourceImpl: Impl, cursorParam: false })();
+    expect(FakeEventSource.instances.map((es) => es.url)).toEqual(['/api/stream', '/api/stream']);
+  });
+
+  it('rebuilds after a fatal failure with backoff, resuming from the cursor', () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { receiver } = make();
+    const sig = bridge.send('notice/add', { text: 'x' });
+    receiver.ingest(sig);
+    const fatals: boolean[] = [];
+
+    const off = connectSignalStream(receiver, '/api/stream', {
+      EventSourceImpl: Impl,
+      onError: (_e, info) => fatals.push(info.fatal),
+    });
+    FakeEventSource.instances[0]!.emitError({ fatal: true });
+    expect(fatals).toEqual([true]);
+    expect(FakeEventSource.instances).toHaveLength(1); // not synchronously
+
+    vi.advanceTimersByTime(1_000); // first delay is ≤ 1s even with jitter
+    expect(FakeEventSource.instances).toHaveLength(2);
+    expect(FakeEventSource.instances[1]!.url).toContain(`lastEventId=${sig.id}`);
+
+    off();
+    warn.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it('stands back during EventSource’s own retries (non-fatal errors)', () => {
+    vi.useFakeTimers();
+    const { receiver } = make();
+    const fatals: boolean[] = [];
+    const off = connectSignalStream(receiver, '/api/stream', {
+      EventSourceImpl: Impl,
+      onError: (_e, info) => fatals.push(info.fatal),
+    });
+
+    FakeEventSource.instances[0]!.emitError({ fatal: false });
+    vi.advanceTimersByTime(60_000);
+    expect(FakeEventSource.instances).toHaveLength(1); // EventSource handles it
+    expect(fatals).toEqual([false]);
+
+    off();
+    vi.useRealTimers();
+  });
+
+  it('disconnecting cancels a pending rebuild; reconnect: false disables it entirely', () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { receiver } = make();
+
+    const off = connectSignalStream(receiver, '/api/stream', { EventSourceImpl: Impl });
+    FakeEventSource.instances[0]!.emitError({ fatal: true });
+    off(); // during the backoff wait
+    vi.advanceTimersByTime(60_000);
+    expect(FakeEventSource.instances).toHaveLength(1);
+
+    connectSignalStream(receiver, '/api/stream', { EventSourceImpl: Impl, reconnect: false });
+    FakeEventSource.instances[1]!.emitError({ fatal: true });
+    vi.advanceTimersByTime(60_000);
+    expect(FakeEventSource.instances).toHaveLength(2);
+
+    warn.mockRestore();
+    vi.useRealTimers();
   });
 });
