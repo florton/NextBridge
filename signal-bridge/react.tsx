@@ -1,7 +1,7 @@
 'use client';
 
 /**
- * signal-bridge · React glue
+ * next-signal-bridge · React glue
  *
  * Two transports that need React: the RSC tree (`<BridgeSignal>`) and a live
  * stream's lifecycle (`useSignalStream`). Everything else — the contract, the
@@ -13,8 +13,8 @@ import { devWarn, type AnySignal } from './core';
 import type { Receiver } from './receiver';
 import { connectSignalStream, type ConnectOptions } from './stream';
 
-// Client-side stream plumbing, re-exported so `signal-bridge/react` is the
-// one client entry (and server code stays out of client bundles).
+// Client-side stream plumbing, re-exported so `next-signal-bridge/react` is
+// the one client entry (and server code stays out of client bundles).
 export { connectSignalStream } from './stream';
 export type { ConnectOptions } from './stream';
 
@@ -71,39 +71,122 @@ export function BridgeSignal({ signal }: { signal: AnySignal | AnySignal[] | nul
   return null;
 }
 
+interface StreamListeners {
+  onOpen?: ConnectOptions['onOpen'];
+  onError?: ConnectOptions['onError'];
+}
+
+interface SharedConnection {
+  count: number;
+  disconnect: () => void;
+  /** Latest-ref boxes from every mounted hook — fanned out per event. */
+  listeners: Set<{ readonly current: StreamListeners }>;
+  withCredentials?: boolean;
+}
+
+// One EventSource per (receiver, url), refcounted across hook mounts.
+// Browsers cap HTTP/1.1 connections per origin at ~6 — which is what
+// `next dev` on localhost speaks — so per-mount connections exhaust fast.
+// Keyed by receiver so distinct apps/providers on a page never share.
+const sharedConnections = new WeakMap<Receiver<any>, Map<string, SharedConnection>>();
+
+function acquireSharedConnection(
+  receiver: Receiver<any>,
+  url: string,
+  opts: ConnectOptions,
+  listener: { readonly current: StreamListeners },
+): () => void {
+  let byUrl = sharedConnections.get(receiver);
+  if (!byUrl) {
+    byUrl = new Map();
+    sharedConnections.set(receiver, byUrl);
+  }
+
+  let conn = byUrl.get(url);
+  if (!conn) {
+    const created: SharedConnection = {
+      count: 0,
+      disconnect: () => {},
+      listeners: new Set(),
+      withCredentials: opts.withCredentials,
+    };
+    created.disconnect = connectSignalStream(receiver, url, {
+      ...opts,
+      onOpen: () => {
+        for (const l of [...created.listeners]) l.current.onOpen?.();
+      },
+      onError: (event, info) => {
+        for (const l of [...created.listeners]) l.current.onError?.(event, info);
+      },
+    });
+    byUrl.set(url, created);
+    conn = created;
+  } else if (conn.withCredentials !== opts.withCredentials) {
+    // First mount's transport options win for a shared connection.
+    devWarn(
+      `useSignalStream("${url}"): withCredentials differs from the connection already open for this URL — the first mount's value is in effect. Pass shared: false to isolate.`,
+    );
+  }
+
+  conn.count++;
+  conn.listeners.add(listener);
+  const owned = conn;
+  return () => {
+    owned.listeners.delete(listener);
+    if (--owned.count === 0) {
+      byUrl.delete(url);
+      owned.disconnect();
+    }
+  };
+}
+
 /**
  * Subscribes to a signal stream for as long as the component is mounted.
  *
  *   useSignalStream('/api/stream');
  *
- * Reconnection and resume are EventSource's job; overlap is absorbed by the
- * receiver's replay guard. Pass `enabled: false` to hold off (e.g. until
- * you know who the user is).
+ * Mounts sharing a receiver and URL share one connection (see `shared`), so
+ * scattering this hook across components costs one EventSource, not one
+ * each. Reconnection and resume are EventSource's job; overlap is absorbed
+ * by the receiver's replay guard. Pass `enabled: false` to hold off (e.g.
+ * until you know who the user is).
  */
 export function useSignalStream(
   url: string,
-  opts: ConnectOptions & { enabled?: boolean } = {},
+  opts: ConnectOptions & {
+    enabled?: boolean;
+    /**
+     * Share one connection across mounts with the same receiver and URL
+     * (refcounted; closes when the last mount unmounts). All sharers' onOpen/
+     * onError fire per event, but a mount joining an already-open connection
+     * gets no initial onOpen, and non-callback options are fixed by whichever
+     * mount connected first. `false` opts this mount out. Default `true`.
+     */
+    shared?: boolean;
+  } = {},
 ): void {
   const receiver = useReceiver();
-  const { enabled = true, withCredentials, EventSourceImpl, cursorParam, reconnect } = opts;
+  const { enabled = true, shared = true, withCredentials, EventSourceImpl, cursorParam, reconnect } =
+    opts;
 
   // Latest-ref: an inline callback must neither churn the connection (so it
   // can't be an effect dependency) nor go stale (so the effect can't close
   // over it). The stable wrappers below always call the current render's.
-  const callbacks = useRef({ onOpen: opts.onOpen, onError: opts.onError });
+  const callbacks = useRef<StreamListeners>({ onOpen: opts.onOpen, onError: opts.onError });
   useEffect(() => {
     callbacks.current = { onOpen: opts.onOpen, onError: opts.onError };
   });
 
   useEffect(() => {
     if (!enabled) return;
-    return connectSignalStream(receiver, url, {
-      withCredentials,
-      EventSourceImpl,
-      cursorParam,
-      reconnect,
-      onOpen: () => callbacks.current.onOpen?.(),
-      onError: (event, info) => callbacks.current.onError?.(event, info),
-    });
-  }, [receiver, url, enabled, withCredentials, EventSourceImpl, cursorParam, reconnect]);
+    const connectOpts: ConnectOptions = { withCredentials, EventSourceImpl, cursorParam, reconnect };
+    if (!shared) {
+      return connectSignalStream(receiver, url, {
+        ...connectOpts,
+        onOpen: () => callbacks.current.onOpen?.(),
+        onError: (event, info) => callbacks.current.onError?.(event, info),
+      });
+    }
+    return acquireSharedConnection(receiver, url, connectOpts, callbacks);
+  }, [receiver, url, enabled, shared, withCredentials, EventSourceImpl, cursorParam, reconnect]);
 }

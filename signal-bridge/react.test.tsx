@@ -50,7 +50,10 @@ class FakeEventSource {
 }
 const Impl = FakeEventSource as unknown as typeof EventSource;
 
-function Stream({ url, ...opts }: { url: string } & ConnectOptions & { enabled?: boolean }) {
+function Stream({
+  url,
+  ...opts
+}: { url: string } & ConnectOptions & { enabled?: boolean; shared?: boolean }) {
   useSignalStream(url, opts);
   return null;
 }
@@ -118,5 +121,71 @@ describe('useSignalStream', () => {
     expect(FakeEventSource.instances).toHaveLength(0);
     rerender(ui(true));
     expect(FakeEventSource.instances).toHaveLength(1);
+  });
+});
+
+describe('useSignalStream · shared connections', () => {
+  it('mounts sharing a receiver and url share one EventSource', () => {
+    const { receiver } = setup();
+    const { unmount } = render(
+      providers(receiver)(
+        <>
+          <Stream url="/api/stream" EventSourceImpl={Impl} />
+          <Stream url="/api/stream" EventSourceImpl={Impl} />
+        </>,
+      ),
+    );
+    expect(FakeEventSource.instances).toHaveLength(1);
+    unmount();
+    expect(FakeEventSource.instances[0]!.closed).toBe(true);
+  });
+
+  it('the connection survives until the last sharer unmounts', () => {
+    const { receiver } = setup();
+    const ui = (two: boolean) =>
+      providers(receiver)(
+        <>
+          <Stream url="/api/stream" EventSourceImpl={Impl} />
+          {two && <Stream url="/api/stream" EventSourceImpl={Impl} />}
+        </>,
+      );
+
+    const { rerender, unmount } = render(ui(true));
+    expect(FakeEventSource.instances).toHaveLength(1);
+    rerender(ui(false)); // one sharer leaves
+    expect(FakeEventSource.instances[0]!.closed).toBe(false);
+    unmount(); // the last one leaves
+    expect(FakeEventSource.instances[0]!.closed).toBe(true);
+  });
+
+  it("every sharer's callbacks fire on shared connection events", () => {
+    const { receiver } = setup();
+    const first = vi.fn();
+    const second = vi.fn();
+    render(
+      providers(receiver)(
+        <>
+          <Stream url="/api/stream" EventSourceImpl={Impl} onOpen={first} />
+          <Stream url="/api/stream" EventSourceImpl={Impl} onOpen={second} />
+        </>,
+      ),
+    );
+    act(() => FakeEventSource.instances[0]!.emitOpen());
+    expect(first).toHaveBeenCalledOnce();
+    expect(second).toHaveBeenCalledOnce();
+  });
+
+  it('different urls do not share; shared: false opts a mount out', () => {
+    const { receiver } = setup();
+    render(
+      providers(receiver)(
+        <>
+          <Stream url="/api/stream" EventSourceImpl={Impl} />
+          <Stream url="/api/other" EventSourceImpl={Impl} />
+          <Stream url="/api/stream" EventSourceImpl={Impl} shared={false} />
+        </>,
+      ),
+    );
+    expect(FakeEventSource.instances).toHaveLength(3);
   });
 });

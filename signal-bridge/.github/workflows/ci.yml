@@ -1,0 +1,35 @@
+# Runs when this package lives at the root of its own repository (GitHub only
+# reads workflows from the repo root). While the folder is nested inside a
+# parent repo, this file is inert — it activates on extraction, which
+# publishing to npm wants anyway.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: node ${{ matrix.node }} · react ${{ matrix.react }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20, 22]
+        react: [18, 19]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+      - name: Pin React ${{ matrix.react }}
+        if: matrix.react != 19
+        run: npm install --no-save react@${{ matrix.react }} react-dom@${{ matrix.react }} @types/react@${{ matrix.react }} @types/react-dom@${{ matrix.react }}
+      - run: npm run check
+      - run: npm test
+      - run: npm run build

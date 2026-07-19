@@ -1,13 +1,20 @@
 /**
- * signal-bridge · server entry
+ * next-signal-bridge · server entry
  *
- * The SSE Route Handler response and the in-memory backlog hub. Import from
- * Route Handlers, Server Actions, and other server modules — never from
- * client components (the split exists so your bundler enforces that).
+ * The SSE Route Handler response, the in-memory backlog hub, and the keyed
+ * channel registry. Import from Route Handlers, Server Actions, and other
+ * server modules — never from client components (the split exists so your
+ * bundler enforces that).
  */
 
 export { signalStream } from './stream';
 export type { StreamContext, StreamOptions } from './stream';
 
-export { createSignalHub } from './hub';
-export type { SignalHub, SignalHubOptions } from './hub';
+export { createSignalHub, createSignalHubs } from './hub';
+export type {
+  AsyncSignalHub,
+  SignalHub,
+  SignalHubOptions,
+  SignalHubs,
+  SignalHubsOptions,
+} from './hub';

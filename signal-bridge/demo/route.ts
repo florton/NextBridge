@@ -3,7 +3,7 @@
 // The flagship: a typed, resumable delta stream, served from an ordinary Next
 // Route Handler. No websocket server, no extra infrastructure — and with the
 // hub, the whole handler is replay + follow-along.
-import { signalStream } from '../stream';
+import { signalStream } from '../stream'; // in your app: 'next-signal-bridge/server'
 import { appBridge } from './bridge';
 import { hub } from './hub';
 

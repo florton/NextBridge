@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
-import { defineBridge, type AnySignal, type InferSignals, type InferState } from './core';
+import { defineBridge, uuid, type AnySignal, type InferSignals, type InferState } from './core';
 import { createReceiver, type Target } from './receiver';
 import { connectSignalStream, signalStream, type StreamContext } from './stream';
-import { createSignalHub } from './hub';
+import { createSignalHub, createSignalHubs } from './hub';
 
 interface S {
   notices: string[];
@@ -79,6 +79,62 @@ describe('parse', () => {
     expect(bridge.parse({ ...base, id: 'a\rb' })).toBeNull();
     expect(bridge.parse({ ...base, id: 'x'.repeat(257) })).toBeNull(); // bloats the seen set
     expect(bridge.parse({ ...base, id: 'x'.repeat(256) })).not.toBeNull();
+  });
+});
+
+describe('uuid', () => {
+  it('stays unique without crypto.randomUUID (insecure-context fallback)', () => {
+    vi.stubGlobal('crypto', undefined);
+    try {
+      const ids = new Set(Array.from({ length: 1000 }, () => uuid()));
+      expect(ids.size).toBe(1000);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
+describe('payloadGuards', () => {
+  const guarded = defineBridge(
+    initialState,
+    {
+      'notice/add': (p: { text: string }, s) => ({ notices: [...s.notices, p.text] }),
+      'notice/clear': (_: void, _s) => ({ notices: [] }),
+      'user/rename': (p: { name: string }, s) => ({ user: { ...s.user, name: p.name } }),
+    },
+    {
+      payloadGuards: {
+        'notice/add': (p) => typeof (p as { text?: unknown } | null)?.text === 'string',
+        'user/rename': () => {
+          throw new Error('guard exploded');
+        },
+      },
+    },
+  );
+
+  it('parse rejects a payload its guard refuses, accepts one it passes', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    expect(guarded.parse({ id: '1', type: 'notice/add', payload: { text: 42 } })).toBeNull();
+    expect(guarded.parse({ id: '2', type: 'notice/add', payload: { text: 'ok' } })).not.toBeNull();
+    warn.mockRestore();
+  });
+
+  it('a throwing guard rejects instead of throwing', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    expect(() => guarded.parse({ id: '3', type: 'user/rename', payload: { name: 'x' } })).not.toThrow();
+    expect(guarded.parse({ id: '3', type: 'user/rename', payload: { name: 'x' } })).toBeNull();
+    warn.mockRestore();
+  });
+
+  it('types without a guard skip payload validation', () => {
+    expect(guarded.parse({ id: '4', type: 'notice/clear', payload: 'whatever' })).not.toBeNull();
+  });
+
+  it('the options arg does not collapse payload inference', () => {
+    const sig = guarded.send('notice/add', { text: 'typed' });
+    expectTypeOf(sig.payload).toEqualTypeOf<{ text: string }>();
+    // @ts-expect-error — a wrong payload must still fail to compile
+    guarded.send('notice/add', { text: 42 });
   });
 });
 
@@ -278,6 +334,69 @@ describe('createSignalHub', () => {
     const c = hub.publish(bridge.send('notice/add', { text: 'c' }));
     expect(hub.lastId()).toBe(c.id);
   });
+
+  it('counts live subscribers', () => {
+    const hub = createSignalHub();
+    expect(hub.subscriberCount()).toBe(0);
+    const off = hub.subscribe(() => {});
+    expect(hub.subscriberCount()).toBe(1);
+    off();
+    expect(hub.subscriberCount()).toBe(0);
+  });
+});
+
+describe('createSignalHubs', () => {
+  it('returns the same hub per key, isolated across keys', () => {
+    const hubs = createSignalHubs();
+    const a = hubs.channel('user:a');
+    const b = hubs.channel('user:b');
+    expect(hubs.channel('user:a')).toBe(a);
+
+    const seen: string[] = [];
+    a.subscribe((s) => seen.push(`a:${s.type}`));
+    b.subscribe((s) => seen.push(`b:${s.type}`));
+    a.publish(bridge.send('notice/add', { text: 'x' }));
+    expect(seen).toEqual(['a:notice/add']);
+  });
+
+  it("scopes replay: one channel's cursor never reaches another's backlog", () => {
+    const hubs = createSignalHubs();
+    const sig = hubs.channel('user:a').publish(bridge.send('notice/add', { text: 'private' }));
+    expect(hubs.channel('user:b').since(sig.id)).toEqual([]);
+  });
+
+  it('delete drops a channel; the next access starts fresh', () => {
+    const hubs = createSignalHubs();
+    const a = hubs.channel('a');
+    a.publish(bridge.send('notice/add', { text: 'x' }));
+    expect(hubs.delete('a')).toBe(true);
+    expect(hubs.channel('a')).not.toBe(a);
+    expect(hubs.channel('a').lastId()).toBeUndefined();
+  });
+
+  it('evicts the least-recently-used idle channel past maxChannels', () => {
+    const hubs = createSignalHubs({ maxChannels: 2 });
+    hubs.channel('a');
+    hubs.channel('b');
+    hubs.channel('a'); // touch: b becomes least recently used
+    hubs.channel('c'); // over cap → evict b
+    expect(hubs.keys()).toEqual(['a', 'c']);
+  });
+
+  it('never evicts a live channel — exceeds the cap instead, then catches up', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const hubs = createSignalHubs({ maxChannels: 2 });
+    const offA = hubs.channel('a').subscribe(() => {});
+    hubs.channel('b').subscribe(() => {});
+    hubs.channel('c'); // a and b are live, c is the newcomer → nothing evictable
+    expect(hubs.keys()).toEqual(['a', 'b', 'c']);
+    expect(warn).toHaveBeenCalledOnce();
+
+    offA(); // a goes idle
+    hubs.channel('d'); // over cap → evicts every idle LRU (a, then c) down to the cap
+    expect(hubs.keys()).toEqual(['b', 'd']);
+    warn.mockRestore();
+  });
 });
 
 describe('type utilities', () => {
@@ -460,11 +579,85 @@ describe('signalStream', () => {
         for (let i = 0; i < 100; i++) emit(bridge.send('notice/add', { text: String(i) }));
         return cleanup;
       },
-      { maxBufferedFrames: 5 },
+      { maxBufferedFrames: 5, maxStallMs: false },
     );
     expect(cleanup).toHaveBeenCalledOnce(); // guard tripped during the burst
     const frames = (await drain(res)).split('\n\n').filter((c) => c.includes('data: '));
     expect(frames.length).toBeLessThan(100);
+    warn.mockRestore();
+  });
+
+  it('closes a stream whose consumer reads nothing for maxStallMs', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const cleanup = vi.fn();
+    // No reader at all: only heartbeats accumulate — the frame-count guard
+    // would take 1000 frames to trip, but the time guard notices in ~100ms.
+    signalStream(new Request('http://x/stream'), () => cleanup, {
+      heartbeatMs: 10,
+      maxStallMs: 100,
+    });
+    await vi.advanceTimersByTimeAsync(500);
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledOnce();
+    warn.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it('never stalls out a consumer that keeps reading', async () => {
+    vi.useFakeTimers();
+    const cleanup = vi.fn();
+    const res = signalStream(new Request('http://x/stream'), () => cleanup, {
+      heartbeatMs: 10,
+      maxStallMs: 30,
+    });
+    const reader = res.body!.getReader();
+    const pump = (async () => {
+      while (!(await reader.read()).done) {
+        /* keep draining */
+      }
+    })();
+    await vi.advanceTimersByTimeAsync(500); // ≫ maxStallMs of wall-clock heartbeats
+    expect(cleanup).not.toHaveBeenCalled();
+    await reader.cancel(); // client disconnects normally
+    expect(cleanup).toHaveBeenCalledOnce();
+    await pump;
+    vi.useRealTimers();
+  });
+
+  it('supports an async start: emits after an await land on the wire, cleanup still runs', async () => {
+    const cleanup = vi.fn();
+    const res = signalStream(new Request('http://x/stream'), async ({ emit, close }) => {
+      await Promise.resolve(); // e.g. `await hub.since(...)` on a Redis-backed hub
+      emit(bridge.send('notice/add', { text: 'later' }));
+      close();
+      return cleanup;
+    });
+    expect(await drain(res)).toContain('later');
+    expect(cleanup).toHaveBeenCalledOnce();
+  });
+
+  it('honors an async cleanup that resolves after the stream already ended', async () => {
+    const cleanup = vi.fn();
+    let resolveStart!: (c: () => void) => void;
+    signalStream(new Request('http://x/stream'), (ctx) => {
+      ctx.close(); // stream ends before start() settles
+      return new Promise<() => void>((resolve) => {
+        resolveStart = resolve;
+      });
+    });
+    resolveStart(cleanup);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(cleanup).toHaveBeenCalledOnce(); // late-arriving cleanup is not leaked
+  });
+
+  it('closes the stream when an async start rejects', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const res = signalStream(new Request('http://x/stream'), async () => {
+      throw new Error('auth failed late');
+    });
+    expect(await drain(res)).toBe(': ok\n\n'); // clean close, not an errored body
+    expect(warn).toHaveBeenCalledOnce();
     warn.mockRestore();
   });
 });

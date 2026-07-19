@@ -1,5 +1,5 @@
 /**
- * signal-bridge · hub (server, zero-dependency)
+ * next-signal-bridge · hub (server, zero-dependency)
  *
  * The backlog piece that makes resume real: an in-memory pub/sub with a
  * ring-buffer history, so a Route Handler can replay what a reconnecting
@@ -14,10 +14,16 @@
  *     return hub.subscribe(emit);
  *   });
  *
+ * One global hub broadcasts everything to everyone — right for genuinely
+ * global data (a status ticker, a deploy banner). The moment signals belong
+ * to a user, a tenant, or a room, use `createSignalHubs` and key a channel
+ * per scope, or private data will be replayed to strangers.
+ *
  * In-memory means one server process (`next start`, a container). On
- * serverless / multi-instance deployments, implement this same three-function
- * shape over shared infrastructure (Redis pub/sub + a capped stream, Postgres
- * LISTEN/NOTIFY) and the route handler doesn't change — see README → Deploying.
+ * serverless / multi-instance deployments, implement the `AsyncSignalHub`
+ * shape over shared infrastructure (Redis pub/sub + a capped list, Postgres
+ * LISTEN/NOTIFY) and the route handler barely changes — see README → Deploying,
+ * which includes a reference Redis implementation.
  */
 
 import { devWarn, type AnySignal } from './core';
@@ -55,6 +61,27 @@ export interface SignalHub {
    * connection then resumes from the snapshot's moment, gap-free.
    */
   lastId(): string | undefined;
+  /**
+   * Live subscribers right now. Lets `createSignalHubs` refuse to evict a
+   * channel someone is still streaming from, and doubles as a cheap
+   * "is anyone listening" check.
+   */
+  subscriberCount(): number;
+}
+
+/**
+ * The loosened contract for hubs backed by shared infrastructure (Redis,
+ * Postgres), where reads are necessarily async. The in-memory `SignalHub`
+ * satisfies it as-is, so a route handler written against this shape —
+ * `await hub.since(...)`, `await hub.lastId()` — works with either and lets
+ * you swap the backing store without touching the route. `signalStream`
+ * accepts an async `start` callback for exactly this. See README → Deploying.
+ */
+export interface AsyncSignalHub {
+  publish<S extends AnySignal>(signal: S): S;
+  subscribe(fn: (signal: AnySignal) => void): () => void;
+  since(cursor: string | undefined): AnySignal[] | Promise<AnySignal[]>;
+  lastId(): string | undefined | Promise<string | undefined>;
 }
 
 export function createSignalHub(options: SignalHubOptions = {}): SignalHub {
@@ -111,5 +138,98 @@ export function createSignalHub(options: SignalHubOptions = {}): SignalHub {
       if (ring.length === 0) return undefined;
       return ring[(head + ring.length - 1) % ring.length]!.id;
     },
+
+    subscriberCount: () => subscribers.size,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Channels — scoped hubs for multi-user apps
+// ---------------------------------------------------------------------------
+
+export interface SignalHubsOptions {
+  /** Ring capacity of each channel's hub. Default 500. */
+  capacity?: number;
+  /**
+   * How many channels to keep before evicting the least-recently-used one
+   * (keyed maps grow forever otherwise — one channel per user who ever
+   * visited). Eviction skips channels with live subscribers, so an active
+   * stream is never split from its publishers; if every channel is live, the
+   * cap is exceeded rather than break one. An evicted channel only loses its
+   * replay backlog — the next `channel(key)` starts a fresh hub, and a
+   * reconnecting client gets best-effort replay, exactly as after a server
+   * restart. Default 1000.
+   */
+  maxChannels?: number;
+}
+
+export interface SignalHubs {
+  /**
+   * The hub for one scope key — `user:42`, `tenant:acme`, `room:7`. Created
+   * on first use; the same key returns the same hub (and marks it
+   * recently-used). Derive the key from the *authenticated* session on the
+   * server, never from a client-supplied value, or scoping is decorative.
+   */
+  channel(key: string): SignalHub;
+  /** Drop a channel and its backlog (e.g. on logout / room teardown). */
+  delete(key: string): boolean;
+  /** Current channel keys, least-recently-used first. */
+  keys(): string[];
+}
+
+/**
+ * A keyed registry of hubs — the scoping primitive:
+ *
+ *   const hubs = createSignalHubs();              // module scope, like a hub
+ *
+ *   // publish (Server Action, webhook): scope by the data's owner
+ *   hubs.channel(`user:${order.userId}`).publish(bridge.send('order/status', ...));
+ *
+ *   // app/api/stream/route.ts: scope by the *authenticated* caller
+ *   const hub = hubs.channel(`user:${session.userId}`);
+ *   return signalStream(req, ({ emit, lastEventId }) => {
+ *     for (const missed of hub.since(lastEventId)) emit(missed);
+ *     return hub.subscribe(emit);
+ *   });
+ *
+ * Replay isolation falls out: `since()` only ever reaches one channel's
+ * backlog, so one user's deltas cannot be replayed to another.
+ */
+export function createSignalHubs(options: SignalHubsOptions = {}): SignalHubs {
+  const maxChannels = Math.max(1, options.maxChannels ?? 1000);
+  // Map iteration order is insertion order; `channel()` re-inserts on access,
+  // making the first key the least recently used.
+  const hubs = new Map<string, SignalHub>();
+
+  return {
+    channel(key) {
+      const existing = hubs.get(key);
+      if (existing) {
+        hubs.delete(key);
+        hubs.set(key, existing);
+        return existing;
+      }
+      const hub = createSignalHub({ capacity: options.capacity });
+      hubs.set(key, hub);
+      if (hubs.size > maxChannels) {
+        // Evict idle channels, LRU first — never the one just created, and
+        // never one someone is streaming from (that would silently split its
+        // subscribers from future publishes).
+        for (const [candidate, candidateHub] of hubs) {
+          if (hubs.size <= maxChannels) break;
+          if (candidate !== key && candidateHub.subscriberCount() === 0) hubs.delete(candidate);
+        }
+        if (hubs.size > maxChannels) {
+          devWarn(
+            `${hubs.size} channels all have live subscribers — exceeding maxChannels (${maxChannels}) rather than splitting one.`,
+          );
+        }
+      }
+      return hub;
+    },
+
+    delete: (key) => hubs.delete(key),
+
+    keys: () => [...hubs.keys()],
   };
 }

@@ -1,5 +1,5 @@
 /**
- * signal-bridge · core (server-safe, zero-dependency)
+ * next-signal-bridge · core (server-safe, zero-dependency)
  *
  * A typed vocabulary of state deltas that can cross the server/client
  * boundary. Nothing here imports React, Next, or any state library — it's
@@ -68,16 +68,27 @@ export interface Bridge<State, P> {
    * `data:` line) against this contract. Returns `null` for anything that
    * isn't a signal this bridge knows.
    *
-   * Envelope only: it verifies `id`/`type` and that `type` has a reducer.
+   * Envelope always: it verifies `id`/`type` and that `type` has a reducer.
    * Ids must be non-empty, at most 256 chars, and free of line breaks — they
    * feed the replay guard and are echoed into SSE `id:` lines, so anything
    * else is junk even from a trusted server.
-   * Payload shape is **not** validated — signals come from your own server, so
-   * this trusts them exactly as much as you already trust your own API
-   * responses. If a stream is reachable by untrusted parties, validate
-   * payloads yourself (zod et al) before calling `ingest`.
+   * Payload shape is validated only for types with a `payloadGuards` entry.
+   * Without one, the payload is trusted exactly as much as you already trust
+   * your own API responses — fine for same-origin streams; add guards where a
+   * stream crosses a trust boundary.
    */
   parse(raw: unknown): SignalOf<P> | null;
+}
+
+export interface BridgeOptions<P> {
+  /**
+   * Optional per-type payload validators, run by `parse` after the envelope
+   * checks. Return `false` (or throw) to reject the signal. Zero-dependency
+   * but zod-shaped — a schema drops in as
+   * `(p) => schema.safeParse(p).success`. Types without a guard skip payload
+   * validation, so you can guard only the boundary-crossing signals.
+   */
+  payloadGuards?: Partial<{ [K in keyof P]: (payload: unknown) => boolean }>;
 }
 
 /** The state type a bridge manages — `InferState<typeof appBridge>`. */
@@ -89,17 +100,21 @@ export type InferState<B> = B extends Bridge<infer S, any> ? S : never;
  */
 export type InferSignals<B> = B extends Bridge<any, infer P> ? SignalOf<P> : never;
 
+let uuidSeq = 0;
+
 export function uuid(): string {
-  return typeof crypto !== 'undefined' && 'randomUUID' in crypto
-    ? crypto.randomUUID()
-    : Math.random().toString(36).slice(2) + Date.now().toString(36);
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return crypto.randomUUID();
+  // Insecure contexts (plain-http LAN dev) lack randomUUID. Dedupe correctness
+  // rests on id uniqueness, so the fallback carries a monotonic counter: two
+  // ids from the same process can never collide, even in the same millisecond.
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${(uuidSeq++).toString(36)}`;
 }
 
 declare const process: { env: Record<string, string | undefined> } | undefined;
 
 export function devWarn(message: string): void {
   if (typeof process !== 'undefined' && process.env.NODE_ENV !== 'production') {
-    console.warn(`[signal-bridge] ${message}`);
+    console.warn(`[next-signal-bridge] ${message}`);
   }
 }
 
@@ -121,9 +136,13 @@ export function devWarn(message: string): void {
 export function defineBridge<State, P>(
   initialState: State,
   reducers: Reducers<NoInfer<State>, P>,
+  options: BridgeOptions<NoInfer<P>> = {},
 ): Bridge<State, P> {
   // A Set (not `in`) so hostile-looking wire types like "__proto__/x" are inert.
   const known = new Set(Object.keys(reducers as object));
+  const guards = options.payloadGuards as
+    | Partial<Record<string, (payload: unknown) => boolean>>
+    | undefined;
 
   return {
     initialState,
@@ -137,6 +156,19 @@ export function defineBridge<State, P>(
       // oversized bloats the seen set, a line break injects SSE fields.
       if (sig.id === '' || sig.id.length > 256 || /[\r\n]/.test(sig.id)) return null;
       if (!known.has(sig.type)) return null;
+      const guard = guards?.[sig.type];
+      if (guard) {
+        let ok = false;
+        try {
+          ok = guard(sig.payload);
+        } catch {
+          // A throwing guard is a rejection — parse must never throw.
+        }
+        if (!ok) {
+          devWarn(`Payload for "${sig.type}" failed its guard — signal rejected.`);
+          return null;
+        }
+      }
       return { id: sig.id, type: sig.type, payload: sig.payload } as SignalOf<P>;
     },
   };

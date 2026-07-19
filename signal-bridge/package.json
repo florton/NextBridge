@@ -1,8 +1,9 @@
 {
-  "name": "signal-bridge",
-  "version": "0.1.0",
+  "name": "next-signal-bridge",
+  "version": "0.2.0",
   "description": "Typed, deduplicated, resumable state deltas from your Next.js server to your client — over SSE, a Server Action's return value, or the RSC tree. One contract, any store.",
   "license": "MIT",
+  "author": "Flanders Lorton",
   "type": "module",
   "sideEffects": false,
   "files": [
@@ -20,12 +21,25 @@
     "./react": {
       "types": "./dist/react.d.ts",
       "default": "./dist/react.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
+  "keywords": [
+    "nextjs",
+    "react",
+    "sse",
+    "server-sent-events",
+    "realtime",
+    "server-actions",
+    "rsc",
+    "typescript",
+    "state"
+  ],
   "scripts": {
     "build": "tsup",
     "check": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepublishOnly": "npm run check && npm test && npm run build"
   },
   "peerDependencies": {
     "react": ">=18.0.0"

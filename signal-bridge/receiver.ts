@@ -1,5 +1,5 @@
 /**
- * signal-bridge · receiver (framework-agnostic, zero-dependency)
+ * next-signal-bridge · receiver (framework-agnostic, zero-dependency)
  *
  * Applies signals to whatever holds your state. The library deliberately
  * doesn't own a store: a `Target` is two functions, so Zustand, Redux, Jotai,

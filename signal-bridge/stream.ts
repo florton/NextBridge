@@ -1,5 +1,5 @@
 /**
- * signal-bridge · SSE transport
+ * next-signal-bridge · SSE transport
  *
  * The piece nothing else offers: a typed, deduplicated, resumable server→client
  * delta stream for Next. Server-Sent Events rather than websockets because SSE
@@ -52,6 +52,16 @@ export interface StreamOptions {
    */
   maxBufferedFrames?: number | false;
   /**
+   * Close the stream when the consumer has read *nothing* for this long while
+   * frames sit unconsumed — the time-based complement to `maxBufferedFrames`,
+   * which alone would hold a silently-vanished client for hours on a quiet
+   * stream (1000 frames of 15s heartbeats ≈ 4 hours). Checked on writes, so
+   * heartbeats set its resolution; with heartbeats disabled it only triggers
+   * on real traffic. Same safety story: the client reconnects and resumes.
+   * `false` disables. Default 60s.
+   */
+  maxStallMs?: number | false;
+  /**
    * Query param read as the resume cursor when the `Last-Event-ID` header is
    * absent (i.e. on fresh connections, which cannot set headers). Must match
    * the client's `cursorParam`. `false` disables. Default `"lastEventId"`.
@@ -90,6 +100,8 @@ function cursorFrom(request: Request, cursorParam: string | false): string | und
   }
 }
 
+type StreamCleanup = () => void;
+
 /**
  * Builds a streaming `Response` of signals:
  *
@@ -104,17 +116,24 @@ function cursorFrom(request: Request, cursorParam: string | false): string | und
  *
  * Return a cleanup function from `start` to release resources. It runs exactly
  * once, whichever way the stream ends: the client disconnects, the request
- * aborts, the server calls `close()`, the backpressure guard trips, or `start`
- * itself throws.
+ * aborts, the server calls `close()`, a stall guard trips, or `start` itself
+ * throws or rejects.
+ *
+ * `start` may be async — replaying from a shared-infrastructure hub, or an
+ * auth check that has to happen after headers. The stream is already flowing
+ * while it runs, and its resolved cleanup is honored even if the stream ended
+ * before `start` settled.
  */
 export function signalStream(
   request: Request,
-  start: (ctx: StreamContext) => void | (() => void),
+  start: (ctx: StreamContext) => void | StreamCleanup | Promise<void | StreamCleanup>,
   options: StreamOptions = {},
 ): Response {
   const heartbeatMs = options.heartbeatMs ?? 15_000;
   const maxBufferedFrames =
     options.maxBufferedFrames === false ? false : Math.max(1, options.maxBufferedFrames ?? 1_000);
+  const maxStallMs =
+    options.maxStallMs === false ? false : Math.max(1, options.maxStallMs ?? 60_000);
 
   // Assigned inside `start` below; `cancel` (consumer-side teardown) needs it.
   let finish: (closeController: boolean) => void = () => {};
@@ -122,8 +141,13 @@ export function signalStream(
   const body = new ReadableStream<Uint8Array>({
     start: (controller) => {
       let open = true;
-      let cleanup: (() => void) | void;
+      let cleanup: StreamCleanup | void;
       let heartbeat: ReturnType<typeof setInterval> | undefined;
+      // Stall tracking: `lastDesired` is desiredSize as of the previous write.
+      // Each write enqueues exactly one chunk (desiredSize −1); any rise above
+      // that means the consumer read something in between.
+      let stallStart: number | undefined;
+      let lastDesired: number | undefined;
 
       const runCleanup = () => {
         try {
@@ -161,11 +185,31 @@ export function signalStream(
         }
         // desiredSize goes negative as unread frames queue; a healthy consumer
         // keeps it near 1. Deeply negative means the client stalled.
-        if (maxBufferedFrames !== false && (controller.desiredSize ?? 0) <= -maxBufferedFrames) {
+        const desired = controller.desiredSize ?? 0;
+        if (maxBufferedFrames !== false && desired <= -maxBufferedFrames) {
           devWarn(
             `Stream buffered ${maxBufferedFrames}+ frames with no consumer progress — closing so the client reconnects and resumes.`,
           );
           finish(true);
+          return;
+        }
+        if (maxStallMs !== false) {
+          if (desired >= 0) {
+            stallStart = undefined; // fully drained — healthy
+          } else if (
+            stallStart === undefined || // just went backlogged — start the clock
+            lastDesired === undefined ||
+            desired > lastDesired - 1 // consumer read something since last write — restart it
+          ) {
+            stallStart = Date.now();
+          } else if (Date.now() - stallStart > maxStallMs) {
+            devWarn(
+              `Stream consumer read nothing for ${maxStallMs}ms with frames pending — closing so the client reconnects and resumes.`,
+            );
+            finish(true);
+            return;
+          }
+          lastDesired = desired;
         }
       };
 
@@ -190,7 +234,23 @@ export function signalStream(
       }
 
       try {
-        cleanup = start(ctx);
+        const result = start(ctx);
+        if (result && typeof (result as PromiseLike<unknown>).then === 'function') {
+          (result as Promise<void | StreamCleanup>).then(
+            (resolved) => {
+              cleanup = typeof resolved === 'function' ? resolved : undefined;
+              // The stream may have ended while start() was awaiting; its
+              // just-arrived cleanup must still run (exactly once).
+              if (!open) runCleanup();
+            },
+            (error) => {
+              devWarn(`Stream start() rejected: ${String(error)} — closing the stream.`);
+              finish(true);
+            },
+          );
+        } else {
+          cleanup = result as void | StreamCleanup;
+        }
       } catch (error) {
         devWarn(`Stream start() threw: ${String(error)} — closing the stream.`);
         finish(true);
