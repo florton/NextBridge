@@ -405,6 +405,33 @@ describe('type utilities', () => {
     const sig: InferSignals<typeof bridge> = bridge.send('user/rename', { name: 'Ada' });
     expect(sig.type).toBe('user/rename');
   });
+
+  it('a malformed reducer is a loud local error, not a silent collapse', () => {
+    // Inference path: per-property constraint, so the error lands on the
+    // offending property (the old reverse-inference design silently turned
+    // every payload `unknown` instead).
+    defineBridge(initialState, {
+      'ok/one': (p: { x: number }, s) => ({ notices: [...s.notices, String(p.x)] }),
+      // @ts-expect-error — returns a key that is not part of the state
+      'bad/one': () => ({ nope: true }),
+    });
+
+    // Contract-first path: equally loud, equally local.
+    defineBridge<S, { 'a/one': void }>(initialState, {
+      // @ts-expect-error — returns a key that is not part of the state
+      'a/one': () => ({ nope: true }),
+    });
+  });
+
+  it('the contract-first overload types payloads from the declared map', () => {
+    type Signals = { 'n/set': { text: string } };
+    const b = defineBridge<S, Signals>(initialState, {
+      'n/set': (p, s) => ({ notices: [...s.notices, p.text] }), // p and s both contextual
+    });
+    expectTypeOf(b.send('n/set', { text: 'x' }).payload).toEqualTypeOf<{ text: string }>();
+    // @ts-expect-error — wrong payload fails on this path too
+    b.send('n/set', { text: 42 });
+  });
 });
 
 describe('signalStream', () => {

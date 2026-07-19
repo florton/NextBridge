@@ -80,7 +80,9 @@ export const appBridge = defineBridge(initialState, {
 
 Annotate **payloads**; `state` is typed for you. Reducers return a patch to merge, so each touches only the keys it names.
 
-**When the contract grows.** Payload inference rides on TypeScript reverse-inferring the whole reducer literal — and one malformed property makes it silently give up, typing *every* payload `unknown`. For loud errors instead, declare the signal map once and pass both type arguments:
+**Malformed reducers fail loudly, per property.** Payload types are read off each reducer's first parameter and checked property-by-property, so a reducer that returns a non-state key (or otherwise breaks the shape) is a compile error *at that reducer* — there is no way for one bad property to silently degrade the rest of the contract. (While such an error is unresolved, sibling `send` calls may also error; both disappear together when you fix the reported reducer.)
+
+**Prefer the contract as the source of truth?** Declare the signal map once and pass both type arguments — same per-property errors, and `p`/`s` are both contextually typed:
 
 ```ts
 type AppSignals = {
@@ -90,7 +92,7 @@ type AppSignals = {
 export const appBridge = defineBridge<AppState, AppSignals>(initialState, { /* reducers */ });
 ```
 
-A bad reducer is then a per-property error at that reducer, not a silent collapse everywhere else. `InferState<typeof appBridge>` and `InferSignals<typeof appBridge>` extract the types back out — the latter is the right type for a Server Action's `signal` slot.
+`InferState<typeof appBridge>` and `InferSignals<typeof appBridge>` extract the types back out of either form — the latter is the right type for a Server Action's `signal` slot.
 
 ## Wiring a store
 

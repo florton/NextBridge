@@ -13,6 +13,8 @@ export type {
   BridgeOptions,
   InferSignals,
   InferState,
+  PayloadsOf,
+  ReducerMap,
   Reducers,
   SendFn,
   Signal,
