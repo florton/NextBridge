@@ -13,20 +13,26 @@ import { createReceiver } from '../receiver';
 import { SignalProvider } from '../react';
 import { appBridge, type AppState } from './bridge';
 
-function createApp(initialState?: Partial<AppState>) {
+function createApp(initialState?: Partial<AppState>, initialCursor?: string) {
   const store = createStore<AppState>(() => ({ ...appBridge.initialState, ...initialState }));
 
-  const receiver = createReceiver(appBridge, {
-    getState: () => store.getState(),
-    // Zustand's third setState arg is the devtools action label, so every
-    // server-pushed delta shows up named in the timeline.
-    setState: (patch, label) =>
-      (store.setState as (p: Partial<AppState>, r?: false, a?: string) => void)(
-        patch,
-        false,
-        label,
-      ),
-  });
+  const receiver = createReceiver(
+    appBridge,
+    {
+      getState: () => store.getState(),
+      // Zustand's third setState arg is the devtools action label, so every
+      // server-pushed delta shows up named in the timeline.
+      setState: (patch, label) =>
+        (store.setState as (p: Partial<AppState>, r?: false, a?: string) => void)(
+          patch,
+          false,
+          label,
+        ),
+    },
+    // The snapshot's cursor: the first connection resumes from the moment
+    // the server rendered `initialState`, so nothing falls in the gap.
+    { initialCursor },
+  );
 
   return { store, receiver };
 }
@@ -37,16 +43,19 @@ const AppContext = createContext<App | null>(null);
 
 export function Providers({
   initialState,
+  initialCursor,
   children,
 }: {
   /** Server-known data, seeded so the SSR HTML is already correct. */
   initialState?: Partial<AppState>;
+  /** The hub's `lastId()` captured alongside `initialState` (see layout). */
+  initialCursor?: string;
   children: ReactNode;
 }) {
   // Per mount, never a module singleton: client components render on the
   // server too, and a shared store would bleed state between users.
   const ref = useRef<App | null>(null);
-  ref.current ??= createApp(initialState);
+  ref.current ??= createApp(initialState, initialCursor);
 
   return (
     <AppContext.Provider value={ref.current}>

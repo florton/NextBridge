@@ -57,6 +57,11 @@ export interface StreamOptions {
    * the client's `cursorParam`. `false` disables. Default `"lastEventId"`.
    */
   cursorParam?: string | false;
+  /**
+   * SSE `retry:` hint, in ms — how long the browser waits before an automatic
+   * reconnect. Sent once at stream open. Unset leaves the browser default (~3s).
+   */
+  retryMs?: number;
 }
 
 const encoder = new TextEncoder();
@@ -174,6 +179,9 @@ export function signalStream(
       };
 
       request.signal?.addEventListener('abort', onAbort);
+      if (options.retryMs !== undefined && options.retryMs > 0) {
+        write(`retry: ${Math.floor(options.retryMs)}\n\n`);
+      }
       // Flush a comment immediately: intermediaries that buffer "empty"
       // responses release the connection once bytes flow.
       write(': ok\n\n');

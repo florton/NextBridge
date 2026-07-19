@@ -8,17 +8,20 @@
 //   RSC render      → <BridgeSignal signal={...} />
 import type { ReactNode } from 'react';
 import { appBridge } from './bridge';
+import { hub } from './hub';
 
 // ---- app/actions.ts -------------------------------------------------------
 // 'use server'
 export async function markPaid(orderId: string) {
   // ...charge the card, write the order...
-  return {
-    ok: true as const,
-    orderId,
-    // Type-checked on the server, against the client's reducers.
-    signal: appBridge.send('order/status', { status: 'paid' as const }),
-  };
+  //
+  // Publish once, deliver twice: live-stream clients get it now, and the
+  // caller gets it in the return value for immediate ingest. Both paths
+  // carry the same id, so a client reached by both applies it once — the
+  // replay guard absorbs the overlap. Type-checked on the server, against
+  // the client's reducers.
+  const signal = hub.publish(appBridge.send('order/status', { status: 'paid' as const }));
+  return { ok: true as const, orderId, signal };
 }
 
 // ---- app/layout.tsx (Server Component) ------------------------------------
@@ -30,10 +33,17 @@ export async function RootLayout({ children }: { children: ReactNode }) {
   // first byte and hydration matches.
   const presence = { online: 3 };
 
+  // Capture the hub's cursor WITH the snapshot: the first stream connection
+  // then replays only what happened after this render — no gap between
+  // seeding the store and subscribing to the stream.
+  const cursor = hub.lastId();
+
   return (
     <html lang="en">
       <body>
-        <Providers initialState={{ presence }}>{children}</Providers>
+        <Providers initialState={{ presence }} initialCursor={cursor}>
+          {children}
+        </Providers>
       </body>
     </html>
   );

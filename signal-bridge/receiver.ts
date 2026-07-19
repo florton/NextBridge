@@ -38,15 +38,30 @@ export interface Receiver<P> {
    */
   accept(raw: unknown): boolean;
   /**
-   * The id of the most recent signal applied — the stream cursor. Hand it back
-   * on reconnect (SSE does this automatically via `Last-Event-ID`) so the
+   * The stream cursor: the id of the most recent signal applied, or the
+   * seeded `initialCursor` until one is. `connectSignalStream` hands it back
+   * on fresh connections (and SSE retries send it as `Last-Event-ID`) so the
    * server can resume rather than replay from the beginning.
    */
   lastId(): string | undefined;
 }
 
-/** Bounds the replay guard; ids older than this can re-apply after a replay. */
-const SEEN_LIMIT = 500;
+export interface ReceiverOptions {
+  /**
+   * Size of the replay guard: how many signal ids are remembered for dedupe.
+   * Ids older than the window can re-apply if a replay reaches back that far.
+   * Keep it at least as large as the backlog a reconnect can replay (the
+   * hub's `capacity`). Default 500.
+   */
+  replayWindow?: number;
+  /**
+   * Primes the resume cursor for a store seeded from a snapshot: capture the
+   * hub's `lastId()` when you read the snapshot, pass it here, and the first
+   * stream connection replays only what happened *since* the snapshot —
+   * closing the gap between seeding and subscribing.
+   */
+  initialCursor?: string;
+}
 
 const toList = <T>(v: T | T[] | null | undefined): T[] =>
   v == null ? [] : Array.isArray(v) ? v : [v];
@@ -54,10 +69,12 @@ const toList = <T>(v: T | T[] | null | undefined): T[] =>
 export function createReceiver<State, P>(
   bridge: Bridge<State, P>,
   target: Target<State>,
+  options: ReceiverOptions = {},
 ): Receiver<P> {
   const reducers = bridge.reducers as Reducers<State, P> & Record<string, unknown>;
+  const replayWindow = Math.max(1, options.replayWindow ?? 500);
   const seen = new Set<string>();
-  let last: string | undefined;
+  let last: string | undefined = options.initialCursor;
 
   function apply(sig: SignalOf<P>): boolean {
     const reducer = (reducers as Record<string, (p: unknown, s: State) => Partial<State>>)[
@@ -74,7 +91,7 @@ export function createReceiver<State, P>(
       // is not retried on every replay of the same id.
       if (seen.has(sig.id)) return false;
       seen.add(sig.id);
-      if (seen.size > SEEN_LIMIT) seen.delete(seen.values().next().value!);
+      if (seen.size > replayWindow) seen.delete(seen.values().next().value!);
     }
     try {
       // Read state at apply time so a burst of signals can't overwrite each

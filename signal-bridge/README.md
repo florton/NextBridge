@@ -22,6 +22,18 @@ const status = useAppState((s) => s.order.status);
 
 ---
 
+## Install
+
+Three entries keep server code out of client bundles by construction:
+
+```ts
+import { defineBridge, createReceiver } from 'signal-bridge';          // universal: the contract + receiver
+import { signalStream, createSignalHub } from 'signal-bridge/server';  // Route Handlers, Server Actions
+import { SignalProvider, useSignalStream } from 'signal-bridge/react'; // 'use client' — hooks + stream client
+```
+
+`npm run build` produces `dist/` (ESM + `.d.ts`, `sideEffects: false`, the react entry banner-marked `'use client'`). React is an optional peer dep — skip it and the universal + server entries still work.
+
 ## Scope
 
 **What it does:** carry type-checked, deduplicated deltas across the boundary and apply them to your state.
@@ -66,6 +78,18 @@ export const appBridge = defineBridge(initialState, {
 
 Annotate **payloads**; `state` is typed for you. Reducers return a patch to merge, so each touches only the keys it names.
 
+**When the contract grows.** Payload inference rides on TypeScript reverse-inferring the whole reducer literal — and one malformed property makes it silently give up, typing *every* payload `unknown`. For loud errors instead, declare the signal map once and pass both type arguments:
+
+```ts
+type AppSignals = {
+  'notice/add': { text: string };
+  'order/status': { status: AppState['order']['status'] };
+};
+export const appBridge = defineBridge<AppState, AppSignals>(initialState, { /* reducers */ });
+```
+
+A bad reducer is then a per-property error at that reducer, not a silent collapse everywhere else. `InferState<typeof appBridge>` and `InferSignals<typeof appBridge>` extract the types back out — the latter is the right type for a Server Action's `signal` slot.
+
 ## Wiring a store
 
 The seam is two functions — swap Zustand for anything here:
@@ -79,7 +103,20 @@ const receiver = createReceiver(appBridge, {
 
 Create it **per request**, not at module scope: client components render on the server too, and a shared store bleeds state between users. The `label` is the signal type — with Zustand's `devtools` middleware every server-pushed delta shows up named in the timeline, for free.
 
+An optional third argument tunes the receiver: `replayWindow` sizes the dedupe guard (default 500 — keep it ≥ the hub's `capacity`), and `initialCursor` seeds the resume cursor for a store built from a snapshot (see below).
+
 ## The live stream
+
+The hub is the backbone: publish from anywhere on the server, and the stream route is just replay + follow-along.
+
+```ts
+// app/hub.ts — one per server process
+import { createSignalHub } from 'signal-bridge/server';
+export const hub = createSignalHub({ capacity: 500 });
+
+// anywhere on the server — a Server Action, a webhook, a queue consumer:
+hub.publish(appBridge.send('order/status', { status: 'shipped' }));
+```
 
 ```ts
 // app/api/stream/route.ts
@@ -87,12 +124,8 @@ export const dynamic = 'force-dynamic';
 
 export function GET(request: Request) {
   return signalStream(request, ({ emit, lastEventId }) => {
-    for (const missed of backlogSince(lastEventId)) emit(missed);
-
-    const off = orderEvents.subscribe((status) =>
-      emit(appBridge.send('order/status', { status })),
-    );
-    return off; // cleanup on disconnect — without it you leak a subscription per client
+    for (const missed of hub.since(lastEventId)) emit(missed); // replay what this client missed
+    return hub.subscribe(emit); // follow along live; cleanup runs exactly once, however the stream ends
   });
 }
 ```
@@ -100,6 +133,8 @@ export function GET(request: Request) {
 ```tsx
 useSignalStream('/api/stream'); // connected while mounted
 ```
+
+`publish` returns the signal, so a Server Action can broadcast *and* hand the same signal to its caller in one expression — both paths carry one id, so a client reached by both applies it once.
 
 **Why SSE, not websockets.** SSE rides plain HTTP: no second server, it works from an ordinary Route Handler, it reconnects on its own, and it has a resume cursor built into the protocol. `Signal.id` doubles as the SSE `id:`, so the browser replays it as `Last-Event-ID` and your handler resumes from exactly where the client left off. Overlap on reconnect is absorbed by the receiver's replay guard, so a generous replay window is safe. (A websocket transport is a small addition — it only needs to call `receiver.accept(frame)`.)
 
@@ -123,20 +158,28 @@ Signals apply after hydration. For an event that's correct — a payment confirm
 
 This isn't a tradeoff you pay to avoid — the alternatives are *less* code.
 
+**Seeding without a gap.** A seeded snapshot and a stream subscription start at different moments; events in between would be lost. Close it by capturing the cursor *with* the snapshot: read `hub.lastId()` in the layout, pass it to the receiver as `initialCursor`, and the first connection replays exactly what happened since the render. Snapshot → cursor → resume, with the replay guard absorbing any overlap.
+
+## Deploying
+
+**One Node server** (`next start`, a container, a VPS): the in-memory hub at module scope is all you need — every request lands in the same process. In dev, pin it to `globalThis` (`globalThis.__hub ??= createSignalHub()`) so hot reload doesn't reset the buffer.
+
+**Serverless / multi-instance** (Vercel and friends): each stream is pinned to the instance that opened it, and a Server Action publishing from *another* invocation never reaches an in-memory hub there. Put the backbone in shared infrastructure — Redis pub/sub plus a capped stream (`XADD`/`XRANGE` map 1:1 onto `publish`/`since`), or Postgres LISTEN/NOTIFY — behind the same three functions, and the route handler doesn't change. Function duration caps are not fatal: when the platform kills a long-lived stream at `maxDuration`, the client reconnects with its cursor and resumes. Heartbeat + resume turn forced termination into a routine, invisible reconnect — the design assumes connections die.
+
+**Auth.** EventSource cannot set headers, so streams authenticate with cookies: same-origin sends them by default; cross-origin needs `withCredentials: true` and CORS configured for credentials. The resume cursor rides a query param on fresh connections — it's an opaque signal id, safe for logs — but treat the stream URL as unauthenticated input and authorize inside the handler like any other route.
+
 ## API
 
-| Export | Where | Notes |
+| Export | Entry | Notes |
 |---|---|---|
-| `defineBridge(initialState, reducers)` | server-safe | The contract |
-| `bridge.send(type, payload?)` | server-safe | Typed signal factory |
-| `bridge.parse(raw)` | server-safe | Envelope validation for untrusted input |
-| `createReceiver(bridge, target)` | any runtime | `ingest` / `accept` / `lastId` |
-| `signalStream(request, start, options?)` | server | SSE `Response` for a Route Handler — heartbeat, backpressure, resume built in |
-| `connectSignalStream(receiver, url, options?)` | client | Returns a disconnect function; resumes fresh connections, rebuilds on fatal errors |
-| `SignalProvider` / `useSignalStream` / `BridgeSignal` | `'use client'` | React helpers |
+| `defineBridge(initialState, reducers)` | `signal-bridge` | The contract; `send` / `parse` live on it |
+| `createReceiver(bridge, target, options?)` | `signal-bridge` | `ingest` / `accept` / `lastId`; options: `replayWindow`, `initialCursor` |
+| `InferState<B>` / `InferSignals<B>` | `signal-bridge` | Extract the state / signal-union types from a bridge |
+| `signalStream(request, start, options?)` | `signal-bridge/server` | SSE `Response`; options: `heartbeatMs`, `maxBufferedFrames`, `cursorParam`, `retryMs` |
+| `createSignalHub(options?)` | `signal-bridge/server` | `publish` / `subscribe` / `since` / `lastId`; in-memory, one per process |
+| `connectSignalStream(receiver, url, options?)` | `signal-bridge/react` | Disconnect fn returned; resumes fresh connections, rebuilds on fatal errors |
+| `SignalProvider` / `useReceiver` / `useSignalStream` / `BridgeSignal` | `signal-bridge/react` | `'use client'` React helpers |
 
 ## Status
 
-Prototype, and untested against a running Next server — the suite covers the contract, the receiver (including throw containment), the stream's lifecycle (heartbeat, backpressure, abort, resume via header and query param), a reconnecting client, and a real server → SSE wire → client round trip, but jsdom and `renderToString` are not streaming RSC. Next up: a websocket transport, React tests for `useSignalStream`, and pointing it at a live app.
-
-Related experiments in this repo: [`../zustand-bridge`](../zustand-bridge/README.md) (this plus a Zustand-coupled mutation layer) and [`../src`](../src/core.ts) (a from-scratch store). This folder is the focused version — the other two overlap with TanStack Query on purpose, and lost.
+Prototype, untested against a running Next server. The suite (54 tests) covers the contract, the receiver (throw containment, replay window, seeded cursor), the hub (fanout, eviction, best-effort replay), the stream's lifecycle (heartbeat, backpressure, abort, resume via header and query param), a reconnecting client, the React hooks under Strict Mode, and a real server → SSE wire → client round trip — but jsdom and `renderToString` are not streaming RSC. Next up: pointing it at a live Next app, a Redis-backed hub recipe, and a websocket transport (it only needs to call `receiver.accept(frame)`).

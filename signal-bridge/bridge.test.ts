@@ -1,7 +1,8 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { defineBridge, type AnySignal } from './core';
+import { beforeEach, describe, expect, expectTypeOf, it, vi } from 'vitest';
+import { defineBridge, type AnySignal, type InferSignals, type InferState } from './core';
 import { createReceiver, type Target } from './receiver';
 import { connectSignalStream, signalStream, type StreamContext } from './stream';
+import { createSignalHub } from './hub';
 
 interface S {
   notices: string[];
@@ -200,6 +201,91 @@ describe('receiver', () => {
     expect(receiver.lastId()).toBeUndefined();
     warn.mockRestore();
   });
+
+  it('replayWindow bounds the guard: an evicted id can re-apply', () => {
+    const target = objectTarget();
+    const receiver = createReceiver(bridge, target, { replayWindow: 1 });
+    const a = bridge.send('notice/add', { text: 'a' });
+    receiver.ingest(a);
+    receiver.ingest(bridge.send('notice/add', { text: 'b' })); // evicts a
+    receiver.ingest(a);
+    expect(target.state.notices).toEqual(['a', 'b', 'a']);
+  });
+
+  it('initialCursor seeds lastId until a signal supersedes it', () => {
+    const receiver = createReceiver(bridge, objectTarget(), { initialCursor: 'snap-9' });
+    expect(receiver.lastId()).toBe('snap-9');
+    const sig = bridge.send('notice/add', { text: 'x' });
+    receiver.ingest(sig);
+    expect(receiver.lastId()).toBe(sig.id);
+  });
+});
+
+describe('createSignalHub', () => {
+  it('fans out to subscribers, returns the published signal, and unsubscribes cleanly', () => {
+    const hub = createSignalHub();
+    const seen: string[] = [];
+    const off = hub.subscribe((s) => seen.push(s.id));
+    const sig = hub.publish(bridge.send('notice/add', { text: 'x' }));
+    off();
+    hub.publish(bridge.send('notice/add', { text: 'y' }));
+    expect(seen).toEqual([sig.id]);
+  });
+
+  it('contains a throwing subscriber so the rest still get delivery', () => {
+    const hub = createSignalHub();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const seen: string[] = [];
+    hub.subscribe(() => {
+      throw new Error('bad subscriber');
+    });
+    hub.subscribe((s) => seen.push(s.id));
+    const sig = hub.publish(bridge.send('notice/add', { text: 'x' }));
+    expect(seen).toEqual([sig.id]);
+    expect(warn).toHaveBeenCalledOnce();
+    warn.mockRestore();
+  });
+
+  it('since(undefined) is empty — first connections seed state, they do not replay history', () => {
+    const hub = createSignalHub();
+    hub.publish(bridge.send('notice/add', { text: 'x' }));
+    expect(hub.since(undefined)).toEqual([]);
+  });
+
+  it('since(cursor) returns strictly-after, oldest first; the latest cursor gets nothing', () => {
+    const hub = createSignalHub();
+    const a = hub.publish(bridge.send('notice/add', { text: 'a' }));
+    const b = hub.publish(bridge.send('notice/add', { text: 'b' }));
+    const c = hub.publish(bridge.send('notice/add', { text: 'c' }));
+    expect(hub.since(a.id)).toEqual([b, c]);
+    expect(hub.since(c.id)).toEqual([]);
+  });
+
+  it('evicts oldest at capacity; an evicted cursor gets the whole buffer as best effort', () => {
+    const hub = createSignalHub({ capacity: 2 });
+    const a = hub.publish(bridge.send('notice/add', { text: 'a' }));
+    const b = hub.publish(bridge.send('notice/add', { text: 'b' }));
+    const c = hub.publish(bridge.send('notice/add', { text: 'c' })); // a falls out
+    expect(hub.since(b.id)).toEqual([c]); // ring order survives the wrap
+    expect(hub.since(a.id)).toEqual([b, c]); // unknown cursor → everything we have
+  });
+
+  it('lastId tracks the newest publish — the seed for initialCursor', () => {
+    const hub = createSignalHub({ capacity: 2 });
+    expect(hub.lastId()).toBeUndefined();
+    hub.publish(bridge.send('notice/add', { text: 'a' }));
+    hub.publish(bridge.send('notice/add', { text: 'b' }));
+    const c = hub.publish(bridge.send('notice/add', { text: 'c' }));
+    expect(hub.lastId()).toBe(c.id);
+  });
+});
+
+describe('type utilities', () => {
+  it('extracts the state and signal-union types from a bridge', () => {
+    expectTypeOf<InferState<typeof bridge>>().toEqualTypeOf<S>();
+    const sig: InferSignals<typeof bridge> = bridge.send('user/rename', { name: 'Ada' });
+    expect(sig.type).toBe('user/rename');
+  });
 });
 
 describe('signalStream', () => {
@@ -268,6 +354,13 @@ describe('signalStream', () => {
     });
     // Only the open-flush comment made it out before close.
     expect(await drain(res)).toBe(': ok\n\n');
+  });
+
+  it('sends the retry hint once at open when retryMs is set', async () => {
+    const res = signalStream(new Request('http://x/stream'), ({ close }) => close(), {
+      retryMs: 250,
+    });
+    expect(await drain(res)).toBe('retry: 250\n\n: ok\n\n');
   });
 
   it('emits heartbeat comments so intermediaries see traffic and dead clients get noticed', async () => {
@@ -446,6 +539,12 @@ describe('connectSignalStream', () => {
     receiver.ingest(bridge.send('notice/add', { text: 'x' }));
     connectSignalStream(receiver, '/api/stream', { EventSourceImpl: Impl, cursorParam: false })();
     expect(FakeEventSource.instances.map((es) => es.url)).toEqual(['/api/stream', '/api/stream']);
+  });
+
+  it('a receiver seeded with initialCursor resumes from the snapshot on first connect', () => {
+    const receiver = createReceiver(bridge, objectTarget(), { initialCursor: 'snap-3' });
+    connectSignalStream(receiver, '/api/stream', { EventSourceImpl: Impl })();
+    expect(FakeEventSource.instances[0]!.url).toBe('/api/stream?lastEventId=snap-3');
   });
 
   it('rebuilds after a fatal failure with backoff, resuming from the cursor', () => {

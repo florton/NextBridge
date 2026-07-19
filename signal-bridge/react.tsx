@@ -8,10 +8,15 @@
  * receiver, the SSE plumbing — works without React at all.
  */
 
-import { createContext, useContext, useEffect, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, useRef, type ReactNode } from 'react';
 import { devWarn, type AnySignal } from './core';
 import type { Receiver } from './receiver';
 import { connectSignalStream, type ConnectOptions } from './stream';
+
+// Client-side stream plumbing, re-exported so `signal-bridge/react` is the
+// one client entry (and server code stays out of client bundles).
+export { connectSignalStream } from './stream';
+export type { ConnectOptions } from './stream';
 
 const ReceiverContext = createContext<Receiver<any> | null>(null);
 
@@ -80,20 +85,25 @@ export function useSignalStream(
   opts: ConnectOptions & { enabled?: boolean } = {},
 ): void {
   const receiver = useReceiver();
-  const { enabled = true, withCredentials, EventSourceImpl, onOpen, onError, cursorParam, reconnect } = opts;
+  const { enabled = true, withCredentials, EventSourceImpl, cursorParam, reconnect } = opts;
+
+  // Latest-ref: an inline callback must neither churn the connection (so it
+  // can't be an effect dependency) nor go stale (so the effect can't close
+  // over it). The stable wrappers below always call the current render's.
+  const callbacks = useRef({ onOpen: opts.onOpen, onError: opts.onError });
+  useEffect(() => {
+    callbacks.current = { onOpen: opts.onOpen, onError: opts.onError };
+  });
 
   useEffect(() => {
     if (!enabled) return;
     return connectSignalStream(receiver, url, {
       withCredentials,
       EventSourceImpl,
-      onOpen,
-      onError,
       cursorParam,
       reconnect,
+      onOpen: () => callbacks.current.onOpen?.(),
+      onError: (event, info) => callbacks.current.onError?.(event, info),
     });
-    // Callbacks are intentionally excluded: a caller passing inline functions
-    // would otherwise tear down and rebuild the connection on every render.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [receiver, url, enabled, withCredentials, EventSourceImpl, cursorParam, reconnect]);
 }

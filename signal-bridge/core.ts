@@ -80,6 +80,15 @@ export interface Bridge<State, P> {
   parse(raw: unknown): SignalOf<P> | null;
 }
 
+/** The state type a bridge manages — `InferState<typeof appBridge>`. */
+export type InferState<B> = B extends Bridge<infer S, any> ? S : never;
+
+/**
+ * The union of every signal a bridge can produce — the type for a Server
+ * Action's return slot: `{ signal: InferSignals<typeof appBridge> }`.
+ */
+export type InferSignals<B> = B extends Bridge<any, infer P> ? SignalOf<P> : never;
+
 export function uuid(): string {
   return typeof crypto !== 'undefined' && 'randomUUID' in crypto
     ? crypto.randomUUID()
