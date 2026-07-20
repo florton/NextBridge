@@ -335,6 +335,15 @@ describe('createSignalHub', () => {
     expect(hub.lastId()).toBe(c.id);
   });
 
+  it('a re-published id resumes from its latest occurrence, even after the first copy is evicted', () => {
+    const hub = createSignalHub({ capacity: 2 });
+    const sig = bridge.send('notice/add', { text: 'again' });
+    hub.publish(sig);
+    hub.publish(sig); // same id twice — e.g. a stored signal replayed by the server
+    const c = hub.publish(bridge.send('notice/add', { text: 'c' })); // evicts the first copy
+    expect(hub.since(sig.id)).toEqual([c]); // cursor still resolves, to the newer copy
+  });
+
   it('counts live subscribers', () => {
     const hub = createSignalHub();
     expect(hub.subscriberCount()).toBe(0);

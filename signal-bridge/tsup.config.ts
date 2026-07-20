@@ -11,14 +11,15 @@ export default defineConfig([
     treeshake: true,
   },
   {
-    // Its own config so only this bundle gets the client directive. No
-    // `treeshake` here: tsup's rollup pass strips the banner (esbuild's own
-    // ESM shaking still drops the server half of stream.ts).
+    // Its own config so the client directive survives: no `treeshake`,
+    // because tsup's rollup pass strips directives (esbuild's own ESM shaking
+    // still drops the server half of stream.ts). esbuild preserves the source
+    // file's own 'use client' at the top of the bundle — no banner needed,
+    // and scripts/assert-use-client.mjs fails the build if that ever changes.
     entry: { react: 'react.tsx' },
     format: ['esm'],
     dts: true,
     sourcemap: true,
     external: ['react'],
-    banner: { js: "'use client';" },
   },
 ]);

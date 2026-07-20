@@ -175,6 +175,24 @@ describe('useSignalStream · shared connections', () => {
     expect(second).toHaveBeenCalledOnce();
   });
 
+  it('a mount joining an already-open connection gets an immediate onOpen', () => {
+    const { receiver } = setup();
+    const late = vi.fn();
+    const ui = (two: boolean) =>
+      providers(receiver)(
+        <>
+          <Stream url="/api/stream" EventSourceImpl={Impl} />
+          {two && <Stream url="/api/stream" EventSourceImpl={Impl} onOpen={late} />}
+        </>,
+      );
+
+    const { rerender } = render(ui(false));
+    act(() => FakeEventSource.instances[0]!.emitOpen()); // opens before the second mount
+    rerender(ui(true));
+    expect(FakeEventSource.instances).toHaveLength(1); // still shared
+    expect(late).toHaveBeenCalledOnce(); // and the late joiner knows it's connected
+  });
+
   it('different urls do not share; shared: false opts a mount out', () => {
     const { receiver } = setup();
     render(

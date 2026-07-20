@@ -88,6 +88,11 @@ export function createSignalHub(options: SignalHubOptions = {}): SignalHub {
   const capacity = Math.max(1, options.capacity ?? 500);
   const ring: AnySignal[] = [];
   let head = 0; // index of the oldest entry once the ring is full
+  let published = 0; // total ever published — the next signal's sequence number
+  // id → publish sequence, so since() finds a cursor in O(1) instead of
+  // scanning the ring. Entries are evicted with their ring slot, so it never
+  // outgrows `capacity`.
+  const seqOf = new Map<string, number>();
   const subscribers = new Set<(signal: AnySignal) => void>();
 
   /** Logical index (0 = oldest) → buffered signal. */
@@ -98,9 +103,14 @@ export function createSignalHub(options: SignalHubOptions = {}): SignalHub {
       if (ring.length < capacity) {
         ring.push(signal);
       } else {
+        const evicted = ring[head]!;
+        // If this id was re-published later, the map points at the newer
+        // occurrence — keep that one.
+        if (seqOf.get(evicted.id) === published - capacity) seqOf.delete(evicted.id);
         ring[head] = signal;
         head = (head + 1) % capacity;
       }
+      seqOf.set(signal.id, published++);
       // Snapshot so a subscriber unsubscribing mid-fanout doesn't skip others.
       for (const fn of [...subscribers]) {
         try {
@@ -120,18 +130,17 @@ export function createSignalHub(options: SignalHubOptions = {}): SignalHub {
 
     since(cursor) {
       if (!cursor || ring.length === 0) return [];
-      // Newest-first search: a healthy reconnect's cursor sits near the tail.
-      for (let i = ring.length - 1; i >= 0; i--) {
-        if (at(i).id === cursor) {
-          const out: AnySignal[] = [];
-          for (let j = i + 1; j < ring.length; j++) out.push(at(j));
-          return out;
-        }
+      const cursorSeq = seqOf.get(cursor);
+      if (cursorSeq === undefined) {
+        // Unknown cursor: the client is further behind than the buffer reaches.
+        const all: AnySignal[] = [];
+        for (let i = 0; i < ring.length; i++) all.push(at(i));
+        return all;
       }
-      // Unknown cursor: the client is further behind than the buffer reaches.
-      const all: AnySignal[] = [];
-      for (let i = 0; i < ring.length; i++) all.push(at(i));
-      return all;
+      const oldestSeq = published - ring.length;
+      const out: AnySignal[] = [];
+      for (let seq = cursorSeq + 1; seq < published; seq++) out.push(at(seq - oldestSeq));
+      return out;
     },
 
     lastId() {

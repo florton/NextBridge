@@ -36,7 +36,7 @@
     "state"
   ],
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && node scripts/assert-use-client.mjs",
     "check": "tsc --noEmit",
     "test": "vitest run",
     "prepublishOnly": "npm run check && npm test && npm run build"

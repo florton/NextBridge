@@ -146,7 +146,7 @@ useSignalStream('/api/stream'); // connected while mounted
 
 **Production posture is built in.** The server flushes a comment immediately (so buffering proxies release the stream), heartbeats every 15s (so idle timeouts don't kill the connection, and a silently vanished client is *noticed* instead of leaking its subscription), and closes a stalled stream on either of two guards — a buffer bound (`maxBufferedFrames`) and a no-reads-for-too-long clock (`maxStallMs`) — safe, because closing just triggers reconnect-and-resume. The client covers the two cases EventSource won't: it carries `receiver.lastId()` as a `?lastEventId=` query param, so *fresh* connections (a remount, a restored tab) resume too, not just automatic retries — and when EventSource fails permanently (an expired session, a deploy), it rebuilds the connection with capped, jittered backoff. All of it is tunable: `heartbeatMs`, `maxBufferedFrames`, `maxStallMs`, `cursorParam`, `reconnect`, and `onError` reports `{ fatal }` so you can tell a blip from a dead stream.
 
-**One connection, however many mounts.** Mounts of `useSignalStream` that share a receiver and URL share one EventSource (refcounted; closed when the last unmounts), so scattering the hook across components costs one connection, not one each. That matters in dev: `next dev` speaks HTTP/1.1, where browsers allow ~6 connections per origin. Every sharer's `onOpen`/`onError` still fire; pass `shared: false` to isolate a mount.
+**One connection, however many mounts.** Mounts of `useSignalStream` that share a receiver and URL share one EventSource (refcounted; closed when the last unmounts), so scattering the hook across components costs one connection, not one each. That matters in dev: `next dev` speaks HTTP/1.1, where browsers allow ~6 connections per origin. Every sharer's `onOpen`/`onError` still fire — including an immediate `onOpen` for a mount that joins an already-open connection — and `shared: false` isolates a mount.
 
 ## Scoping to users, tenants, rooms
 
@@ -224,6 +224,14 @@ This isn't a tradeoff you pay to avoid — the alternatives are *less* code.
 
 1. **Stream lifetime.** Function duration caps end long-lived responses at `maxDuration`. This degrades gracefully: the client reconnects with its cursor and resumes, so a capped stream becomes periodic reconnection, not data loss. Heartbeat + resume turn forced termination into a routine, invisible reconnect — the design assumes connections die. Do cost-model it: every open stream holds a warm function.
 2. **Hub visibility.** In-memory state is per-instance: a Server Action publishing on one instance never reaches a stream pinned to another. **This failure is silent** — whether a client sees a publish depends on which instance served which request — so the backbone must move to shared infrastructure.
+
+**Vercel checklist**, concretely:
+
+- On the stream route: `export const dynamic = 'force-dynamic'` (any caching kills SSE), and raise `export const maxDuration` as far as your plan allows — each cap hit is an invisible reconnect-and-resume, but shorter caps mean more churn. Set `retryMs` so a deploy doesn't stampede reconnects.
+- Keep the stream route on the **Node runtime** (no `runtime = 'edge'`): the Redis hub client needs Node, and duration limits bite edge streams too.
+- Assume **more than one instance from day one**: use the Redis-backed hub below for both fan-out and replay. The in-memory `createSignalHub`/`createSignalHubs` are only correct on Vercel if you can guarantee a single warm instance — you can't.
+- Cost-model open streams: every connected client holds a warm function for up to `maxDuration`. (Fluid compute's active-CPU pricing helps here, since an idle stream is mostly waiting.)
+- **The hybrid escape hatch** if function-hours or connection counts get silly: keep the app on Vercel and serve *only* the stream route from a small always-on Node service — `signalStream` speaks standard web `Request`/`Response`, so a tiny Hono/Express(+adapter) server hosting the same bridge + Redis hub works verbatim. Point `useSignalStream` at its URL with CORS and `withCredentials: true`.
 
 The seam is `AsyncSignalHub`: the same hub shape with reads allowed to be async (`signalStream` accepts an async `start` for exactly this). The in-memory hub satisfies it too, so a route written against it — `await hub.since(...)` — works with either backing and swaps without touching the route. A reference Redis implementation:
 
