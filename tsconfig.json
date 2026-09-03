@@ -1,4 +1,6 @@
 {
+  // Toolchain config for the archived variants only.
+  // signal-bridge/ is the shipping package and carries its own tsconfig.json.
   "compilerOptions": {
     "target": "ES2022",
     "lib": ["ES2022", "DOM"],
@@ -13,10 +15,9 @@
     "types": []
   },
   "include": [
-    "next-bridge/src",
-    "next-bridge/demo12",
-    "next-bridge/test",
-    "zustand-bridge",
-    "signal-bridge"
+    "archive/next-bridge/src",
+    "archive/next-bridge/demo12",
+    "archive/next-bridge/test",
+    "archive/zustand-bridge"
   ]
 }

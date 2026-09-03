@@ -1,3 +1,7 @@
+> **Archived.** Superseded by [`next-signal-bridge`](../../signal-bridge/README.md) — see the
+> [repo README](../../README.md#the-archive) for why. Kept for the record; run its tests from the
+> repo root with `npm run test:archive` and `npm run check:archive`.
+
 # Next Bridge
 
 Typed, serializable **signals** across the Next.js server/client boundary, plus a tiny slice store to receive them. Server Actions and Server Components return plain-data instructions; the client store applies them with full TypeScript inference end to end.

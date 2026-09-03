@@ -1,3 +1,7 @@
+> **Archived.** Superseded by [`next-signal-bridge`](../../signal-bridge/README.md) — see the
+> [repo README](../../README.md#the-archive) for why. Kept for the record; run its tests from the
+> repo root with `npm run test:archive` and `npm run check:archive`.
+
 # zustand-bridge (experimental)
 
 A prototype of the "boundary layer, not a store" direction: keep **plain Zustand** for state, and add one thing on top — a **typed, serializable signal channel** across the Next.js server/client boundary. This is the alternative to the from-scratch store in [`../next-bridge`](../next-bridge/src/core.ts); it exists so the two approaches can be compared side by side.

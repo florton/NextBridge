@@ -1,23 +1,16 @@
 {
-  "name": "next-bridge",
-  "version": "0.12.0",
-  "description": "Typed, serializable signals across the Next.js server/client boundary — a tiny slice store with Server Action and RSC back-channels.",
+  "name": "signal-bridge-repo",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Development root. The published package is next-signal-bridge, in signal-bridge/.",
   "license": "MIT",
   "type": "module",
-  "sideEffects": false,
-  "files": [
-    "next-bridge/src"
-  ],
-  "exports": {
-    ".": "./next-bridge/src/core.ts",
-    "./client": "./next-bridge/src/client.tsx"
-  },
   "scripts": {
-    "check": "tsc --noEmit",
-    "test": "vitest run"
-  },
-  "peerDependencies": {
-    "react": ">=18.0.0"
+    "check": "npm --prefix signal-bridge run check",
+    "test": "npm --prefix signal-bridge run test",
+    "build": "npm --prefix signal-bridge run build",
+    "check:archive": "tsc --noEmit",
+    "test:archive": "vitest run archive"
   },
   "engines": {
     "node": ">=18"
