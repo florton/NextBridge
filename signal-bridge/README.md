@@ -346,7 +346,7 @@ export async function GET(request: Request) {
 
 ## Status
 
-Pre-1.0 and not yet battle-tested against a running Next app — treat it as a well-tested core, not a proven product. The suite (74 tests) covers the contract (including payload guards and inference-preservation type tests), the receiver (throw containment, replay window, seeded cursor), hubs (fanout, eviction, best-effort replay, channel isolation and LRU eviction that never splits a live channel), the stream's lifecycle (heartbeat, both stall guards, abort, async `start`, resume via header and query param), a reconnecting client, the React hooks under Strict Mode (including connection sharing), and a real server → SSE wire → client round trip — but jsdom and `renderToString` are not streaming RSC. Next up: pointing it at a live Next app, and a websocket transport (it only needs to call `receiver.accept(frame)`).
+Pre-1.0 and not yet battle-tested against a running Next app — treat it as a well-tested core, not a proven product. The suite (78 tests) covers the contract (including payload guards and inference-preservation type tests), the receiver (throw containment, replay window, seeded cursor), hubs (fanout, eviction, best-effort replay, channel isolation and LRU eviction that never splits a live channel), the stream's lifecycle (heartbeat, both stall guards, abort, async `start`, resume via header and query param), a reconnecting client, the React hooks under Strict Mode (including connection sharing), and a real server → SSE wire → client round trip — but jsdom and `renderToString` are not streaming RSC. Next up: pointing it at a live Next app, and a websocket transport (it only needs to call `receiver.accept(frame)`).
 
 ## License
 
