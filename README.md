@@ -1,221 +1,91 @@
-# Next Bridge
+# Bridge
 
-Typed, serializable **signals** across the Next.js server/client boundary, plus a tiny slice store to receive them. Server Actions and Server Components return plain-data instructions; the client store applies them with full TypeScript inference end to end.
+Three takes on one problem: **a state change happens on the Next.js server — how does it
+reach the client with its types intact?**
 
-- **Type-safe end to end** — slice names, action names, and payloads are all inferred. A typo'd action or wrong payload shape in a Server Action fails `tsc`, not production.
-- **Fast by construction** — per-slice subscriptions and `Object.is` selector bailouts mean a component re-renders only when the exact value it reads changes. Store updates are an O(1) map lookup, not a reducer scan.
-- **Small** — ~1.4 kB min+gzip total, zero dependencies, React 18+ as the only peer. No Next.js import, so it can't break on a Next internals refactor.
-- **Built on documented surfaces** — works *with* the App Router (RSC props, Server Action return values), never reaching into private framework internals, so a Next.js refactor can't silently break it.
+All three share a shape. You declare a *contract* once in server-safe code: the initial
+state, plus a reducer per `"slice/action"`. The server builds signals against it
+(`send('order/status', { status: 'shipped' })`) and the client applies them. A wrong
+action name or payload fails `tsc` rather than production.
+
+They differ in **how much of your app they insist on owning**, and the repo reads as a
+straight line: each version gives away more than the last.
+
+| | [`next-bridge/`](next-bridge/) | [`zustand-bridge/`](zustand-bridge/) | [`signal-bridge/`](signal-bridge/) |
+|---|---|---|---|
+| Owns | the store | the channel | the channel |
+| State engine | written from scratch | plain Zustand | **yours — any** |
+| Delivery | Server Action, RSC | Server Action, RSC | + **live SSE push** |
+| Package | `next-bridge` 0.12.0 | not packaged | `next-signal-bridge` 0.2.0 |
+| Tests | 17 | 34 | 78 |
+| Status | superseded | experiment | **current** |
+
+## Start here
+
+**[`signal-bridge/`](signal-bridge/README.md) is the one to read.** It is the most recent,
+the most agnostic, and the only one built to be published — LICENSE, changelog, `tsup`
+build, and a CI matrix (Node 18/20/22 × React 18/19) that arms itself the moment the
+folder is extracted to its own repo. The other two are kept because the reasoning that
+produced it is visible in them, not out of nostalgia.
+
+## How it got here
+
+**`next-bridge` — own the store.** The first answer: a small slice store written from
+nothing, with the signal channel built in. It works, and it is genuinely tiny (~1.4 kB
+min+gzip, zero dependencies). But owning the store means owning SSR, devtools,
+persistence, middleware, and the per-request instantiation that keeps one user's state
+from bleeding into another's — a large surface to re-earn, and all of it solved
+elsewhere already.
+
+**`zustand-bridge` — own only the channel.** So: keep plain Zustand, and add one thing on
+top. The server-singleton hazard disappears by construction (the store is created per
+request in the provider, never at module scope), and Zustand's ecosystem comes along for
+free. This is also where request *ordering* got worked out — `execute` takes a thunk
+rather than a promise, because a promise is already in flight by the time you hand it
+over, so a library given one can only watch the race, never prevent it. Owning *when* the
+request fires is what makes `order: 'queue'` possible, and that matters more than it
+looks: dropping a stale response doesn't undo a stale write.
+
+**`signal-bridge` — own nothing.** The last thing to give away was Zustand itself. A
+`Target` is two functions, `getState` and `setState`, so Zustand, Redux, Jotai or a plain
+object all work and the library never imports a state library at all. With the store
+gone, the interesting problem moved to the wire: deltas now arrive over an SSE Route
+Handler with replay dedupe, a resume cursor, heartbeats and two stall guards — and the
+same contract still covers a Server Action's return value and the RSC tree. One contract,
+any transport, any store.
+
+## Layout
 
 ```
-npm: not yet published — see "Publishing" below.
-Until then: copy src/core.ts and src/client.tsx into your app (e.g. lib/bridge/).
+signal-bridge/    next-signal-bridge — current. Own package.json, dist, LICENSE, CHANGELOG.
+zustand-bridge/   the boundary-layer experiment. Unit-tested, deliberately unpackaged.
+next-bridge/      v1: the from-scratch store.
+  src/              the library
+  demo12/           a full runnable example app
+  test/             unit + type tests
+  archive/          suss0…suss11 — the prototypes behind v1. Not typechecked, not shipped.
 ```
 
----
+The root `package.json` is both the v1 `next-bridge` manifest and the shared dev
+toolchain (TypeScript, Vitest, React) for all three. `signal-bridge/` additionally carries
+its own manifest, because it is the one that gets published.
 
-## Mental model
+## Running it
 
-A **Signal** is a JSON-safe instruction: `{ id, type: 'slice/action', payload }`. Anything that can serialize a signal can drive the client store:
-
-| Channel | You write | Client applies it via |
-|---|---|---|
-| Server Action → client | `return { ok, ...data, signal: store.send(...) }` | `store.execute(actionPromise)` |
-| Server Component → client | `<BridgeSignal signal={store.send(...)} />` | effect after hydration, deduped by id |
-| Client → client | `actions.cart.add({ sku })` | immediate dispatch |
-
-Handlers are pure reducers `(payload, state) => nextState`. They always run against the state **at the moment of execution** — never a captured snapshot — so rapid-fire dispatches can't regress each other.
-
-## Quickstart
-
-### 1. Define the store — `app/store.ts` (no directive; importable everywhere)
-
-```ts
-import { createStore, slice } from 'next-bridge';
-
-export const appStore = createStore({
-  user: slice(
-    { name: 'Ada', plan: 'free' as 'free' | 'pro' },
-    {
-      rename:  (payload: { name: string }, state) => ({ ...state, name: payload.name }),
-      setPlan: (payload: { plan: 'free' | 'pro' }, state) => ({ ...state, plan: payload.plan }),
-    },
-  ),
-  cart: slice(
-    { items: [] as string[] },
-    {
-      add:   (payload: { sku: string }, state) => ({ items: [...state.items, payload.sku] }),
-      clear: (_: void, state) => ({ ...state, items: [] }), // void payload → zero-arg action
-    },
-  ),
-});
+```bash
+npm install
+npm run check    # tsc --noEmit across all three
+npm test         # 129 tests
 ```
 
-Annotate **payloads**; `state` is typed for you from the slice's initial state.
+`next-bridge/archive/` is excluded from both by design — the root `tsconfig.json` names
+its includes rather than globbing.
 
-### 2. Providers file — `app/providers.tsx`
+## Status
 
-A store holds functions, so a Server Component can't pass it as a prop. Bind it inside a one-time client wrapper (the same pattern Redux and Zustand document for Next.js):
-
-```tsx
-'use client';
-import { BridgeProvider } from 'next-bridge/client';
-import { appStore } from './store';
-
-export function Providers({ children }: { children: React.ReactNode }) {
-  return <BridgeProvider store={appStore}>{children}</BridgeProvider>;
-}
-```
-
-```tsx
-// app/layout.tsx — stays a Server Component
-import { Providers } from './providers';
-
-export default function RootLayout({ children }: { children: React.ReactNode }) {
-  return (
-    <html lang="en">
-      <body><Providers>{children}</Providers></body>
-    </html>
-  );
-}
-```
-
-### 3. Read and write from client components
-
-```tsx
-'use client';
-import { useBridge } from 'next-bridge/client';
-import { appStore } from './store';
-
-export function Cart() {
-  const [cart, actions] = useBridge(appStore, 'cart');           // whole slice
-  return <button onClick={() => actions.add({ sku: 'A1' })}>{cart.items.length}</button>;
-}
-
-export function PlanBadge() {
-  const [plan] = useBridge(appStore, 'user', (s) => s.plan);     // selector: re-renders
-  return <span>{plan}</span>;                                    // only when plan changes
-}
-```
-
-`store.actions` also works outside React — event handlers, tests, anywhere.
-
-### 4. Server Action back-channel
-
-```ts
-// app/actions.ts
-'use server';
-import { appStore } from './store';
-
-export async function checkout(skus: string[]) {
-  const orderId = await placeOrder(skus);
-  return { ok: true as const, orderId, signal: appStore.send('cart', 'clear') };
-}
-```
-
-```tsx
-// client
-const result = await appStore.execute(checkout(cart.items));
-console.log(result.orderId); // typed — execute returns your result as-is
-```
-
-### 5. Server Component → client signal
-
-```tsx
-// app/page.tsx — Server Component
-import { BridgeSignal } from 'next-bridge/client';
-import { appStore } from './store';
-
-export default async function Page() {
-  const plan = await getPlanFromDb();
-  return (
-    <main>
-      <BridgeSignal signal={appStore.send('user', 'setPlan', { plan })} />
-      {/* ... */}
-    </main>
-  );
-}
-```
-
-Streaming-safe: the signal applies when its chunk mounts. Each signal id applies at most once, so Strict Mode double-effects and back/forward re-mounts don't double-fire.
-
-### 6. Optimistic updates
-
-```tsx
-const result = await appStore.execute(saveName(draft), {
-  optimistic: appStore.send('user', 'rename', { name: draft }),
-});
-```
-
-The optimistic signal applies immediately. If the promise **rejects** or resolves with **`ok: false`**, the affected slice rolls back to its pre-optimistic state.
-
-A full runnable example lives in [`demo12/`](demo12/store.ts).
-
----
-
-## API
-
-### `next-bridge` (server-safe core — no React)
-
-| Export | Signature | Notes |
-|---|---|---|
-| `slice` | `slice(initialState, handlers)` | Inference helper; handlers are `(payload, state) => nextState` |
-| `createStore` | `createStore({ name: slice(...) })` | Builds routes and bound actions once, at creation |
-| `store.get()` | `() => state tree` | Slice references are replaced on every update |
-| `store.initial` | readonly state tree | Frozen at creation; the SSR snapshot |
-| `store.actions` | `actions.user.rename({ name })` | Stable references; usable outside React |
-| `store.send` | `send('user', 'rename', { name })` | Creates a `Signal` — server-safe, fully checked |
-| `store.dispatch` | `dispatch(signal)` | Immediate, no dedupe/ordering guard |
-| `store.ingest` | `ingest(signal \| signal[] \| null)` | Dedupes by signal id; for custom transports (SSE, WS) |
-| `store.execute` | `execute(promise, { optimistic? })` | Applies `result.signal`, guards ordering, handles rollback |
-| `store.subscribe` | `subscribe('user', fn) => unsub` | Per-slice; the hook uses this internally |
-
-### `next-bridge/client` (`'use client'`)
-
-| Export | Signature | Notes |
-|---|---|---|
-| `BridgeProvider` | `<BridgeProvider store={appStore}>` | Binds the store for `<BridgeSignal>`; render inside your providers file |
-| `BridgeSignal` | `<BridgeSignal signal={...} />` | Renders `null`; applies signal(s) post-hydration, deduped by id |
-| `useBridge` | `useBridge(store, 'slice', selector?)` → `[value, actions]` | SSR-safe subscription with selector bailout |
-
----
-
-## Semantics and guarantees
-
-**Rendering.** Subscriptions are registered per slice, so an update to `cart` never even evaluates `user` subscribers. With a selector, the hook keeps the previous result when `Object.is` says the selected value didn't change, and React bails out of the re-render.
-
-**SSR / hydration.** `useBridge` passes a `getServerSnapshot` that reads `store.initial`, satisfying React 18's `useSyncExternalStore` contract — no SSR throw, no hydration mismatch. Server-created signals apply *after* hydration, in an effect. Consequence: the first client paint shows initial state. For data that must be correct at first paint, render it as ordinary RSC props/children; use signals for events and cache-sync, not initial data.
-
-**Race protection** guards the two ways async state desyncs:
-
-1. *Stale client reads* — handlers are executed against live state at dispatch time, functional-update style. Two rapid `increment`s always see each other's writes.
-2. *Out-of-order responses* — every `execute` takes a monotonic sequence number at call time. If op #2's response lands before op #1's, op #1's late signal of the same type is dropped instead of overwriting newer data.
-
-**Optimistic rollback** restores a slice-level snapshot taken just before the optimistic signal applied. If *other* writes hit the same slice while the action was in flight, rollback restores the snapshot over them (last-write-wins). Keep optimistic actions scoped to the state they own.
-
-**Unknown signals** (e.g., a stale client receiving a signal for a handler you've since renamed) are dropped with a dev-only warning — never a crash. Routing is a `Map` lookup, so hostile-looking type strings like `"__proto__/x"` are inert.
-
-**Module scope.** `createStore` state lives at module scope. On the server, nothing writes to it (signals apply client-side only), so there is no cross-request leakage; the server only ever reads `initial`.
-
----
-
-## Testing
-
-`npm test` runs the core suite (17 tests): action/state semantics, per-slice notification isolation, no-op change detection, signal serialization round-trip, ingest replay dedupe, and the full `execute` matrix — out-of-order responses, optimistic apply, rollback on reject, rollback on `ok: false`.
-
-`npm run check` type-checks the library, the demo app, **and** [`test/types.check.ts`](test/types.check.ts), a compile-time contract: every `@ts-expect-error` in it must stay an error, so inference regressions fail CI.
-
-Still to add:
-
-- **Render-count assertions** — `@testing-library/react` + jsdom: assert a selector component records exactly one render when an unrelated property in its slice updates.
-- **E2E network simulation** — Playwright: 2s-delayed Server Action, assert loading state, rollback on failure, and no flicker on out-of-order resolution.
-
-## Publishing checklist
-
-- **The name `next-bridge` is taken on npm** (an existing 0.0.1). Pick a scope (`@yourorg/next-bridge`) or a variant before publishing.
-- Build `dist/` (`esbuild` for ESM + `tsc --emitDeclarationOnly` for types), point `exports` at it, and keep the `'use client'` banner on the client bundle (esbuild preserves it from the source directive with `--banner` if needed).
-- Ship `sideEffects: false` (already set) so the core tree-shakes out of client-only apps and vice versa.
+Nothing here is on npm yet. `signal-bridge` is pre-1.0 with a well-tested core but has
+not been run against a live Next app — treat it as a solid core, not a proven product.
 
 ## License
 
-MIT
+MIT.

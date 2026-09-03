@@ -1,6 +1,6 @@
 # zustand-bridge (experimental)
 
-A prototype of the "boundary layer, not a store" direction: keep **plain Zustand** for state, and add one thing on top — a **typed, serializable signal channel** across the Next.js server/client boundary. This is the alternative to the from-scratch store in [`../src`](../src/core.ts); it exists so the two approaches can be compared side by side.
+A prototype of the "boundary layer, not a store" direction: keep **plain Zustand** for state, and add one thing on top — a **typed, serializable signal channel** across the Next.js server/client boundary. This is the alternative to the from-scratch store in [`../next-bridge`](../next-bridge/src/core.ts); it exists so the two approaches can be compared side by side.
 
 ## The idea
 

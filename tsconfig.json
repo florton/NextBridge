@@ -12,5 +12,11 @@
     "noEmit": true,
     "types": []
   },
-  "include": ["src", "demo12", "test", "zustand-bridge", "signal-bridge"]
+  "include": [
+    "next-bridge/src",
+    "next-bridge/demo12",
+    "next-bridge/test",
+    "zustand-bridge",
+    "signal-bridge"
+  ]
 }
