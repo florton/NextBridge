@@ -15,6 +15,14 @@ Renamed **signal-bridge → next-signal-bridge** (the old name is taken on npm).
 - **`uuid()` fallback hardened** — a monotonic counter guarantees per-process uniqueness where `crypto.randomUUID` is unavailable (insecure contexts).
 - README rewritten around deployment reality (single-process vs. serverless, reference Redis hub, scoping recipes), LICENSE file, this changelog, CI workflow (Node 18/20/22 × React 18/19).
 
+### Changed
+
+- **The reducer-inference footgun is gone.** `defineBridge` now infers payload types per property (from each reducer's first parameter) instead of reverse-inferring the whole reducers literal. Previously, one malformed reducer made TypeScript silently abandon inference and type *every* payload `unknown` — `send` stopped type-checking with no error anywhere. Now a malformed reducer is a compile error at that property. The explicit contract-first form (`defineBridge<State, Signals>`) still works via a second overload, with the same per-property errors. New exported types: `ReducerMap`, `PayloadsOf`.
+
+- `hub.since()` resolves cursors in O(1) via an id→sequence map (was a ring scan), with re-published ids resolving to their latest occurrence.
+- A `useSignalStream` mount joining an already-open shared connection now receives an immediate `onOpen`, so per-component "connected" state initializes correctly.
+- `dist/react.js` carries a single `'use client'` directive (was doubled: banner + preserved source directive). The build now asserts the directive survives bundling (`scripts/assert-use-client.mjs`).
+
 ### Fixed
 
 - `demo/hub.ts` now actually pins the hub to `globalThis` (the comment claimed it; the code didn't), so dev HMR can't split subscribers from publishers.

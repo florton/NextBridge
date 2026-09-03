@@ -6,11 +6,11 @@
   "type": "module",
   "sideEffects": false,
   "files": [
-    "src"
+    "next-bridge/src"
   ],
   "exports": {
-    ".": "./src/core.ts",
-    "./client": "./src/client.tsx"
+    ".": "./next-bridge/src/core.ts",
+    "./client": "./next-bridge/src/client.tsx"
   },
   "scripts": {
     "check": "tsc --noEmit",

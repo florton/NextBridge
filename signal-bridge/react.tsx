@@ -81,6 +81,8 @@ interface SharedConnection {
   disconnect: () => void;
   /** Latest-ref boxes from every mounted hook — fanned out per event. */
   listeners: Set<{ readonly current: StreamListeners }>;
+  /** True between onOpen and the next error — lets a late joiner get onOpen. */
+  opened: boolean;
   withCredentials?: boolean;
 }
 
@@ -108,14 +110,19 @@ function acquireSharedConnection(
       count: 0,
       disconnect: () => {},
       listeners: new Set(),
+      opened: false,
       withCredentials: opts.withCredentials,
     };
     created.disconnect = connectSignalStream(receiver, url, {
       ...opts,
       onOpen: () => {
+        created.opened = true;
         for (const l of [...created.listeners]) l.current.onOpen?.();
       },
       onError: (event, info) => {
+        // Any error means the connection is down (EventSource retrying, or a
+        // rebuild pending) — recovery fires a fresh onOpen to everyone.
+        created.opened = false;
         for (const l of [...created.listeners]) l.current.onError?.(event, info);
       },
     });
@@ -130,6 +137,9 @@ function acquireSharedConnection(
 
   conn.count++;
   conn.listeners.add(listener);
+  // A mount joining an already-open connection missed the open event — fire
+  // its callback now so "am I connected" state initializes correctly.
+  if (conn.opened) listener.current.onOpen?.();
   const owned = conn;
   return () => {
     owned.listeners.delete(listener);
@@ -158,8 +168,8 @@ export function useSignalStream(
     /**
      * Share one connection across mounts with the same receiver and URL
      * (refcounted; closes when the last mount unmounts). All sharers' onOpen/
-     * onError fire per event, but a mount joining an already-open connection
-     * gets no initial onOpen, and non-callback options are fixed by whichever
+     * onError fire per event — a mount joining an already-open connection
+     * gets an immediate onOpen. Non-callback options are fixed by whichever
      * mount connected first. `false` opts this mount out. Default `true`.
      */
     shared?: boolean;

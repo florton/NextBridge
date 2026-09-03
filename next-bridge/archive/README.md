@@ -2,7 +2,9 @@
 
 Design history for Next Bridge, kept for reference only. **Not shipped** in the
 npm package (the `files` allowlist in the root `package.json` publishes only
-`src/`) and **not** part of the typecheck (`tsconfig.json` doesn't include it).
+`next-bridge/src/`) and **not** part of the typecheck (the root `tsconfig.json`
+includes `next-bridge/src`, `next-bridge/demo12` and `next-bridge/test` by name,
+so this folder is left out).
 
 - `suss0.ts` … `suss11.tsx` — successive library prototypes (v0 was Zustand-based;
   v8 used `useState`; v11 was the pre-rewrite Pub/Sub monolith).

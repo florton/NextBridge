@@ -27,17 +27,28 @@ export type AnySignal = Signal<string, any>;
 export type SignalOf<P> = { [K in keyof P & string]: Signal<K, P[K]> }[keyof P & string];
 
 /**
- * Reducers keyed by signal type. A homomorphic mapped type over `keyof P`, so
- * inferring it from an object literal preserves the literal keys *and*
- * reverse-infers each payload into `P`, while giving `state` a contextual
- * type.
- *
- * Caveat: one property that violates this shape makes TypeScript abandon
- * reverse-inference for the whole literal — every payload silently becomes
- * `unknown`. Keep negative type tests in their own `defineBridge` call.
+ * Reducers keyed by signal type, for a *declared* payload map `P` — the
+ * contract-first form (`defineBridge<State, Signals>`, or an annotated
+ * standalone const). Inference-first calls go through `ReducerMap` /
+ * `PayloadsOf` instead, which extract `P` from what was written.
  */
 export type Reducers<State, P> = {
   [K in keyof P]: (payload: P[K], state: State) => Partial<State>;
+};
+
+/**
+ * What `defineBridge` checks an inferred reducers literal against. Because
+ * the constraint is per-property, a malformed reducer is a loud error *at
+ * that property* — it cannot silently poison its siblings the way
+ * reverse-inferring the whole literal into `Reducers` could. (While such an
+ * error is present, sibling payloads do degrade to `any`/zero-arg `send`s,
+ * but only alongside a build-breaking error — never silently.)
+ */
+export type ReducerMap<State> = Record<string, (payload: any, state: State) => Partial<State>>;
+
+/** The payload map extracted from an inferred reducer record: each reducer's first parameter. */
+export type PayloadsOf<R> = {
+  [K in keyof R]: R[K] extends (payload: infer Pl, ...rest: any[]) => any ? Pl : never;
 };
 
 /** `[]` for void-payload signals, so `send('cart/clear')` takes no second arg. */
@@ -120,9 +131,9 @@ export function devWarn(message: string): void {
 
 /**
  * Declares the signal contract: the initial state plus a reducer per signal
- * type. `State` is inferred from `initialState` (annotate that once) and each
- * payload is reverse-inferred from the reducer, so `state` is typed for you
- * and you annotate only the payload:
+ * type. `State` is inferred from `initialState` (annotate that once); each
+ * payload is read off its reducer's first parameter, so `state` is typed for
+ * you and you annotate only the payload:
  *
  *   interface AppState { notices: string[] }
  *   const initial: AppState = { notices: [] };
@@ -131,8 +142,26 @@ export function devWarn(message: string): void {
  *     'notice/add': (p: { text: string }, s) => ({ notices: [...s.notices, p.text] }),
  *   });
  *
+ * Inference is per-property (the first overload), so a malformed reducer is
+ * an error at that reducer — there is no way to silently degrade the whole
+ * contract. Prefer a declared signal map as the source of truth? The second
+ * overload takes it explicitly, with the same per-property errors:
+ *
+ *   type AppSignals = { 'notice/add': { text: string } };
+ *   export const bridge = defineBridge<AppState, AppSignals>(initial, { ... });
+ *
  * Reducers return a patch to merge, so they touch only the keys they name.
  */
+export function defineBridge<State, R extends ReducerMap<NoInfer<State>>>(
+  initialState: State,
+  reducers: R,
+  options?: BridgeOptions<NoInfer<PayloadsOf<R>>>,
+): Bridge<State, PayloadsOf<R>>;
+export function defineBridge<State, P>(
+  initialState: State,
+  reducers: Reducers<NoInfer<State>, P>,
+  options?: BridgeOptions<NoInfer<P>>,
+): Bridge<State, P>;
 export function defineBridge<State, P>(
   initialState: State,
   reducers: Reducers<NoInfer<State>, P>,

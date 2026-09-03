@@ -335,6 +335,15 @@ describe('createSignalHub', () => {
     expect(hub.lastId()).toBe(c.id);
   });
 
+  it('a re-published id resumes from its latest occurrence, even after the first copy is evicted', () => {
+    const hub = createSignalHub({ capacity: 2 });
+    const sig = bridge.send('notice/add', { text: 'again' });
+    hub.publish(sig);
+    hub.publish(sig); // same id twice — e.g. a stored signal replayed by the server
+    const c = hub.publish(bridge.send('notice/add', { text: 'c' })); // evicts the first copy
+    expect(hub.since(sig.id)).toEqual([c]); // cursor still resolves, to the newer copy
+  });
+
   it('counts live subscribers', () => {
     const hub = createSignalHub();
     expect(hub.subscriberCount()).toBe(0);
@@ -404,6 +413,33 @@ describe('type utilities', () => {
     expectTypeOf<InferState<typeof bridge>>().toEqualTypeOf<S>();
     const sig: InferSignals<typeof bridge> = bridge.send('user/rename', { name: 'Ada' });
     expect(sig.type).toBe('user/rename');
+  });
+
+  it('a malformed reducer is a loud local error, not a silent collapse', () => {
+    // Inference path: per-property constraint, so the error lands on the
+    // offending property (the old reverse-inference design silently turned
+    // every payload `unknown` instead).
+    defineBridge(initialState, {
+      'ok/one': (p: { x: number }, s) => ({ notices: [...s.notices, String(p.x)] }),
+      // @ts-expect-error — returns a key that is not part of the state
+      'bad/one': () => ({ nope: true }),
+    });
+
+    // Contract-first path: equally loud, equally local.
+    defineBridge<S, { 'a/one': void }>(initialState, {
+      // @ts-expect-error — returns a key that is not part of the state
+      'a/one': () => ({ nope: true }),
+    });
+  });
+
+  it('the contract-first overload types payloads from the declared map', () => {
+    type Signals = { 'n/set': { text: string } };
+    const b = defineBridge<S, Signals>(initialState, {
+      'n/set': (p, s) => ({ notices: [...s.notices, p.text] }), // p and s both contextual
+    });
+    expectTypeOf(b.send('n/set', { text: 'x' }).payload).toEqualTypeOf<{ text: string }>();
+    // @ts-expect-error — wrong payload fails on this path too
+    b.send('n/set', { text: 42 });
   });
 });
 
